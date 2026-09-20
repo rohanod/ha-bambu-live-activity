@@ -11,12 +11,6 @@ from .helpers import resolve_bambu_entities
 from .runtime import BambuLiveActivityRuntime
 
 
-async def async_setup(hass: HomeAssistant, config: dict) -> bool:
-    """Set up the integration domain."""
-    hass.data.setdefault(DOMAIN, {})
-    return True
-
-
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Bambu Live Activity from a config entry."""
     serial = entry.data[CONF_PRINTER_SERIAL]

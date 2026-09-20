@@ -11,7 +11,7 @@
         },
         "data_description": {
           "printer_device": "The printer whose print progress should appear as a Live Activity.",
-          "notify_service": "Use notify.mobile_app_<device>. Live Activities require the Home Assistant iOS Companion App."
+          "notify_service": "Use the notify.mobile_app_* action for your iPhone. Live Activities require the Home Assistant iOS Companion App."
         }
       },
       "reconfigure": {
