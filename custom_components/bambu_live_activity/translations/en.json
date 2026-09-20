@@ -1,0 +1,53 @@
+{
+  "title": "Bambu Live Activity",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up Bambu Live Activity",
+        "description": "Choose a printer provided by the Bambu Lab custom integration and the Home Assistant Companion App notification action for your iPhone.",
+        "data": {
+          "printer_device": "Bambu printer",
+          "notify_service": "iPhone notification action"
+        },
+        "data_description": {
+          "printer_device": "The printer whose print progress should appear as a Live Activity.",
+          "notify_service": "Use notify.mobile_app_<device>. Live Activities require the Home Assistant iOS Companion App."
+        }
+      },
+      "reconfigure": {
+        "title": "Change iPhone notification action",
+        "data": {
+          "notify_service": "iPhone notification action"
+        }
+      }
+    },
+    "error": {
+      "not_bambu_device": "The selected device does not have a Bambu Lab printer identifier.",
+      "missing_bambu_entities": "Required Bambu Lab print sensors are missing. Make sure ha-bambulab is fully loaded and the printer exposes print status, progress, remaining time, end time, and subtask name.",
+      "notify_action_unavailable": "That notify action is not currently available."
+    },
+    "abort": {
+      "already_configured": "This Bambu printer is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Live Activity behaviour",
+        "description": "Tune how often the activity is refreshed. Lower thresholds feel more live but can be throttled by iOS when updates are not delivered through Local Push.",
+        "data": {
+          "progress_step": "Progress update step",
+          "eta_threshold_minutes": "ETA update threshold",
+          "debounce_seconds": "Debounce burst updates",
+          "notify_finished": "Send a normal notification when finished",
+          "notify_failed": "Send a normal notification when a print fails"
+        },
+        "data_description": {
+          "progress_step": "Send an update after progress changes by at least this many percentage points.",
+          "eta_threshold_minutes": "Send an update when remaining time or finish time changes by at least this many minutes.",
+          "debounce_seconds": "Combine Bambu MQTT updates arriving close together into one Live Activity update."
+        }
+      }
+    }
+  }
+}
