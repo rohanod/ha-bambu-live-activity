@@ -5,16 +5,16 @@
     "bambu_lab"
   ],
   "codeowners": [
-    "@rohanod"
+    "@OWNER"
   ],
   "config_flow": true,
   "dependencies": [
     "mobile_app"
   ],
-  "documentation": "https://github.com/rohanod/ha-bambu-live-activity",
+  "documentation": "https://github.com/OWNER/ha-bambu-live-activity",
   "integration_type": "service",
   "iot_class": "local_push",
-  "issue_tracker": "https://github.com/rohanod/ha-bambu-live-activity/issues",
+  "issue_tracker": "https://github.com/OWNER/ha-bambu-live-activity/issues",
   "requirements": [],
-  "version": "0.1.1"
+  "version": "0.1.2"
 }

@@ -5,16 +5,21 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta
 import logging
+import math
+from pathlib import PurePath
+import re
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 from homeassistant.util import dt as dt_util
 
 from .const import (
     ACTIVE_STATES,
+    BAMBU_DOMAIN,
     CONF_DEBOUNCE_SECONDS,
     CONF_ETA_THRESHOLD_MINUTES,
     CONF_NOTIFY_FAILED,
@@ -42,6 +47,12 @@ from .const import (
 from .helpers import resolve_bambu_entities
 
 _LOGGER = logging.getLogger(__name__)
+
+_BAD_TITLE_PATTERNS = (
+    re.compile(r"^\d+#profileid[-_#]", re.IGNORECASE),
+    re.compile(r"^profileid[-_#]", re.IGNORECASE),
+    re.compile(r"^\d{6,}$"),
+)
 
 
 class BambuLiveActivityRuntime:
@@ -77,7 +88,8 @@ class BambuLiveActivityRuntime:
         self.tag = f"{LIVE_ACTIVITY_TAG_PREFIX}_{serial_fragment}"
 
         self._unsubs: list[Any] = []
-        self._debounce_unsub: Any | None = None
+        self._coalesce_unsub: Any | None = None
+        self._minute_unsub: Any | None = None
         self._rollover_unsub: Any | None = None
         self._start_task: asyncio.Task | None = None
         self._activity_active = False
@@ -86,6 +98,7 @@ class BambuLiveActivityRuntime:
         self._last_progress: int | None = None
         self._last_remaining: int | None = None
         self._last_finish_ts: float | None = None
+        self._last_payload: tuple[Any, ...] | None = None
 
     async def async_start(self) -> None:
         """Start listeners and recover an activity after an HA restart."""
@@ -106,7 +119,8 @@ class BambuLiveActivityRuntime:
             unsub()
         self._unsubs.clear()
 
-        self._cancel_debounce()
+        self._cancel_coalesce()
+        self._cancel_minute_tick()
         self._cancel_rollover()
 
         if self._start_task and not self._start_task.done():
@@ -141,6 +155,9 @@ class BambuLiveActivityRuntime:
                 and abs(progress - self._last_progress) < self.progress_step
             ):
                 return
+            # Every 1% by default. Multiple MQTT fields that arrive together
+            # are coalesced into one push instead of continually resetting a
+            # debounce timer.
             self._schedule_update()
             return
 
@@ -170,17 +187,9 @@ class BambuLiveActivityRuntime:
             return
 
         if entity_id == self.entities[KEY_SUBTASK_NAME]:
-            # Live Activity titles are static after launch. If the first push
-            # had to fall back to the printer name, restart once the real task
-            # name arrives.
-            title = self._clean_text(new_value)
-            if (
-                self._activity_active
-                and title
-                and self._activity_title
-                and title != self._activity_title
-            ):
-                self.hass.async_create_task(self._async_restart_activity())
+            # The ActivityKit title is static. Do NOT clear/recreate the Live
+            # Activity when Bambu metadata changes; doing so feels like a new
+            # notification. The next print will use the newest title.
             return
 
     @callback
@@ -193,7 +202,7 @@ class BambuLiveActivityRuntime:
                 self._queue_begin_activity(delay=START_DELAY_SECONDS)
             else:
                 # Pause/resume and prepare->running should show promptly.
-                self._schedule_update(delay=1)
+                self._schedule_update(delay=0.5)
             return
 
         if new_status in FINISHED_STATES:
@@ -224,7 +233,7 @@ class BambuLiveActivityRuntime:
                 await asyncio.sleep(delay)
             if self._status() not in ACTIVE_STATES:
                 return
-            await self._async_push_activity(starting=True)
+            await self._async_push_activity(starting=True, force=True)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - never break HA for a notification
@@ -232,25 +241,57 @@ class BambuLiveActivityRuntime:
 
     @callback
     def _schedule_update(self, *, delay: int | float | None = None) -> None:
-        """Debounce a burst of Bambu MQTT sensor updates."""
+        """Coalesce a burst of MQTT changes without starving updates.
+
+        Important difference from a classic debounce: once an update has been
+        scheduled, later MQTT events do not push it farther into the future.
+        This guarantees that a busy printer cannot leave the activity stale.
+        """
         if not self._activity_active:
             return
 
-        self._cancel_debounce()
         wait = self.debounce_seconds if delay is None else delay
+
+        if self._coalesce_unsub is not None:
+            # An urgent status transition can shorten an already queued update.
+            if wait <= 1:
+                self._cancel_coalesce()
+            else:
+                return
 
         @callback
         def _send(_: datetime) -> None:
-            self._debounce_unsub = None
+            self._coalesce_unsub = None
             if self._status() in ACTIVE_STATES:
                 self.hass.async_create_task(self._async_push_activity())
 
-        self._debounce_unsub = async_call_later(self.hass, wait, _send)
+        self._coalesce_unsub = async_call_later(self.hass, wait, _send)
 
-    def _cancel_debounce(self) -> None:
-        if self._debounce_unsub is not None:
-            self._debounce_unsub()
-            self._debounce_unsub = None
+    def _cancel_coalesce(self) -> None:
+        if self._coalesce_unsub is not None:
+            self._coalesce_unsub()
+            self._coalesce_unsub = None
+
+    def _cancel_minute_tick(self) -> None:
+        if self._minute_unsub is not None:
+            self._minute_unsub()
+            self._minute_unsub = None
+
+    @callback
+    def _schedule_minute_tick(self) -> None:
+        """Force a refresh once a minute while a print is active."""
+        self._cancel_minute_tick()
+
+        @callback
+        def _tick(_: datetime) -> None:
+            self._minute_unsub = None
+            if self._activity_active and self._status() in ACTIVE_STATES:
+                self.hass.async_create_task(
+                    self._async_push_activity(force=True)
+                )
+                self._schedule_minute_tick()
+
+        self._minute_unsub = async_call_later(self.hass, 60, _tick)
 
     def _cancel_rollover(self) -> None:
         if self._rollover_unsub is not None:
@@ -278,25 +319,27 @@ class BambuLiveActivityRuntime:
         await self._async_clear_activity()
         await asyncio.sleep(2)
         if self._status() in ACTIVE_STATES:
-            await self._async_push_activity(starting=True)
+            await self._async_push_activity(starting=True, force=True)
 
-    async def _async_restart_activity(self) -> None:
-        """Restart so a newly available static title can be applied."""
-        if self._status() not in ACTIVE_STATES:
-            return
-        await self._async_clear_activity()
-        await asyncio.sleep(2)
-        if self._status() in ACTIVE_STATES:
-            await self._async_push_activity(starting=True)
-
-    async def _async_push_activity(self, *, starting: bool = False) -> None:
+    async def _async_push_activity(
+        self, *, starting: bool = False, force: bool = False
+    ) -> None:
         """Send the current printer state to the HA Companion app."""
         progress = self._current_progress()
         remaining = self._current_remaining()
         finish_ts = self._current_finish_timestamp(remaining)
-        title = self._current_title()
+        title = self._activity_title or self._current_title()
         finish_text = self._format_finish_time(finish_ts)
         remaining_text = self._format_remaining(remaining)
+
+        payload_key = (
+            title,
+            progress,
+            remaining_text,
+            finish_text,
+        )
+        if not force and payload_key == self._last_payload:
+            return
 
         payload = {
             "title": title,
@@ -314,23 +357,26 @@ class BambuLiveActivityRuntime:
         await self._async_notify(payload)
 
         self._activity_active = True
-        if starting or self._activity_title is None:
-            self._activity_title = title
-            self._schedule_rollover()
-
+        self._activity_title = title
+        self._last_payload = payload_key
         self._last_progress = progress
         self._last_remaining = remaining
         self._last_finish_ts = finish_ts
 
+        if starting:
+            self._schedule_rollover()
+            self._schedule_minute_tick()
+
     async def _async_finish(self) -> None:
         """Send the finished alert, then end the Live Activity."""
-        self._cancel_debounce()
+        self._cancel_coalesce()
+        self._cancel_minute_tick()
 
         if self.notify_finished:
-            title = self._current_title()
+            title = self._activity_title or self._current_title()
             await self._async_notify(
                 {
-                    "title": "Bambu printer",
+                    "title": "A1 mini",
                     "message": f"{title} finished printing.",
                     "data": {
                         "notification_icon": "mdi:printer-3d",
@@ -343,13 +389,14 @@ class BambuLiveActivityRuntime:
 
     async def _async_fail(self) -> None:
         """Send an optional failed alert, then end the Live Activity."""
-        self._cancel_debounce()
+        self._cancel_coalesce()
+        self._cancel_minute_tick()
 
         if self.notify_failed:
-            title = self._current_title()
+            title = self._activity_title or self._current_title()
             await self._async_notify(
                 {
-                    "title": "Bambu printer",
+                    "title": "A1 mini",
                     "message": f"{title} failed to print.",
                     "data": {
                         "notification_icon": "mdi:printer-3d",
@@ -362,24 +409,27 @@ class BambuLiveActivityRuntime:
 
     async def _async_clear_activity(self) -> None:
         """End the current Live Activity."""
-        self._cancel_debounce()
+        self._cancel_coalesce()
+        self._cancel_minute_tick()
         self._cancel_rollover()
 
-        try:
-            await self._async_notify(
-                {
-                    "message": "clear_notification",
-                    "data": {"tag": self.tag},
-                }
-            )
-        except HomeAssistantError:
-            _LOGGER.debug("Could not clear Live Activity", exc_info=True)
+        if self._activity_active:
+            try:
+                await self._async_notify(
+                    {
+                        "message": "clear_notification",
+                        "data": {"tag": self.tag},
+                    }
+                )
+            except HomeAssistantError:
+                _LOGGER.debug("Could not clear Live Activity", exc_info=True)
 
         self._activity_active = False
         self._activity_title = None
         self._last_progress = None
         self._last_remaining = None
         self._last_finish_ts = None
+        self._last_payload = None
 
     async def _async_notify(self, data: dict[str, Any]) -> None:
         """Call the selected notify.mobile_app_* action."""
@@ -417,14 +467,83 @@ class BambuLiveActivityRuntime:
         return max(0, min(100, value if value is not None else 0))
 
     def _current_remaining(self) -> int:
+        """Return remaining minutes, preferring the authoritative end time.
+
+        Some Bambu print paths temporarily expose remaining_time == 0 while
+        end_time is already valid. Using the end timestamp also makes the
+        displayed minutes count down correctly between MQTT ETA updates.
+        """
+        end_state = self.hass.states.get(self.entities[KEY_END_TIME])
+        end_ts = self._parse_timestamp(
+            end_state.state if end_state is not None else None
+        )
+        if end_ts is not None:
+            seconds = end_ts - dt_util.now().timestamp()
+            if seconds > 0:
+                return max(1, math.ceil(seconds / 60))
+
         state = self.hass.states.get(self.entities[KEY_REMAINING_TIME])
         value = self._safe_int(state.state if state is not None else None)
         return max(0, value if value is not None else 0)
 
+    def _bambu_print_job(self) -> Any | None:
+        """Best-effort access to ha-bambulab's current PrintJob model."""
+        registry = er.async_get(self.hass)
+        status_entry = registry.async_get(self.entities[KEY_PRINT_STATUS])
+        if status_entry is None or status_entry.config_entry_id is None:
+            return None
+
+        coordinator = self.hass.data.get(BAMBU_DOMAIN, {}).get(
+            status_entry.config_entry_id
+        )
+        if coordinator is None:
+            return None
+
+        try:
+            return coordinator.get_model().print_job
+        except (AttributeError, KeyError):
+            return None
+
     def _current_title(self) -> str:
+        """Pick a human-readable print title and reject Bambu profile IDs."""
+        job = self._bambu_print_job()
+        candidates: list[Any] = []
+
+        if job is not None:
+            task_data = getattr(job, "_task_data", None)
+            if isinstance(task_data, dict):
+                # The Bambu cloud task list has a human-facing title. Prefer
+                # that over MQTT subtask_name, which can be a profile ID for
+                # some MakerWorld/Bambu Studio jobs.
+                candidates.extend(
+                    [
+                        task_data.get("title"),
+                        task_data.get("designTitle"),
+                        task_data.get("plateName"),
+                    ]
+                )
+
+            candidates.extend(
+                [
+                    getattr(job, "subtask_name", None),
+                    getattr(job, "gcode_file", None),
+                ]
+            )
+
         state = self.hass.states.get(self.entities[KEY_SUBTASK_NAME])
-        task = self._clean_text(state.state if state is not None else None)
-        return task or self.entry.title or "Bambu printer"
+        if state is not None:
+            candidates.append(state.state)
+
+        for candidate in candidates:
+            cleaned = self._clean_title(candidate)
+            if cleaned is not None:
+                return cleaned
+
+        # The device entry title often includes the serial. Keep the fallback
+        # concise for the Watch Smart Stack.
+        if self.entry.title.upper().startswith("A1MINI"):
+            return "A1 mini"
+        return self.entry.title or "Bambu printer"
 
     def _current_finish_timestamp(self, remaining: int) -> float:
         state = self.hass.states.get(self.entities[KEY_END_TIME])
@@ -450,6 +569,42 @@ class BambuLiveActivityRuntime:
         if not text or text.lower() in {"unknown", "unavailable", "none"}:
             return None
         return text
+
+    @staticmethod
+    def _clean_title(value: Any) -> str | None:
+        text = BambuLiveActivityRuntime._clean_text(value)
+        if text is None:
+            return None
+
+        text = text.replace("\\", "/")
+        if "/" in text:
+            text = PurePath(text).name
+
+        # Strip common Bambu/slicer file suffixes.
+        lower = text.lower()
+        for suffix in (".gcode.3mf", ".gcode", ".3mf"):
+            if lower.endswith(suffix):
+                text = text[: -len(suffix)].strip()
+                lower = text.lower()
+                break
+
+        if not text:
+            return None
+
+        for pattern in _BAD_TITLE_PATTERNS:
+            if pattern.search(text):
+                return None
+
+        # Bambu sometimes embeds the profile marker after a useful prefix.
+        marker = re.search(r"#profileid[-_#]", text, re.IGNORECASE)
+        if marker:
+            useful = text[: marker.start()].strip(" _-#")
+            if useful and not useful.isdigit():
+                text = useful
+            else:
+                return None
+
+        return text[:80]
 
     @staticmethod
     def _parse_timestamp(value: Any) -> float | None:

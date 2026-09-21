@@ -37,7 +37,7 @@ Until this repository is accepted into the default HACS store:
 
 1. HACS → Integrations → **⋮** → Custom repositories
 2. Add:
-   `https://github.com/rohanod/ha-bambu-live-activity`
+   `https://github.com/OWNER/ha-bambu-live-activity`
 3. Category: **Integration**
 4. Install **Bambu Live Activity**
 5. Restart Home Assistant
@@ -64,7 +64,7 @@ From the integration entry → **Configure**:
 
 - progress update step, default **1%**
 - ETA-change threshold, default **1 minute**
-- MQTT burst debounce, default **8 seconds**
+- MQTT burst coalescing, default **3 seconds**
 - finished notification
 - failed-print notification
 
@@ -74,7 +74,7 @@ From the integration entry → **Configure**:
 - Waits briefly for the print name/ETA to populate.
 - Debounces related MQTT updates so progress, ETA, and finish-time changes arriving together become one push.
 - Updates when progress changes by the configured percentage threshold.
-- Updates when remaining time or finish time shifts by the configured ETA threshold.
+- Updates every 1% by default, whenever ETA/finish time shifts by the configured threshold, and at least once every minute while printing.
 - Updates promptly on pause/resume.
 - Sends a normal notification when the print reaches `finish`.
 - Clears the Live Activity on finish, failure, or idle.
@@ -107,7 +107,7 @@ GitHub Actions validate the repository with:
 - HACS Action
 - Home Assistant hassfest
 
-Before the first commit, replace the `rohanod` placeholder:
+Before the first commit, replace the `OWNER` placeholder:
 
 ```bash
 python3 scripts/set-owner.py "$(gh api user --jq .login)"
