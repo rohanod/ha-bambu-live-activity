@@ -74,8 +74,9 @@ From the integration entry → **Configure**:
 - Waits briefly for the print name/ETA to populate.
 - Debounces related MQTT updates so progress, ETA, and finish-time changes arriving together become one push.
 - Updates when progress changes by the configured percentage threshold.
-- Updates every 1% by default, whenever ETA/finish time shifts by the configured threshold, and at least once every minute while printing.
+- Updates every 1% by default and at least once every minute while printing. Each update carries the latest ETA/finish time.
 - Updates promptly on pause/resume.
+- Live Activity refreshes are sent silently/passively so progress changes do not buzz the phone or Watch.
 - Sends a normal notification when the print reaches `finish`.
 - Clears the Live Activity on finish, failure, or idle.
 - Restarts the Live Activity after about **7.5 hours** so long prints continue past Apple's per-activity 8-hour expiry.

@@ -161,29 +161,14 @@ class BambuLiveActivityRuntime:
             self._schedule_update()
             return
 
-        if entity_id == self.entities[KEY_REMAINING_TIME]:
-            remaining = self._safe_int(new_value)
-            if remaining is None:
-                return
-            if (
-                self._last_remaining is not None
-                and abs(remaining - self._last_remaining) < self.eta_threshold
-            ):
-                return
-            self._schedule_update()
-            return
-
-        if entity_id == self.entities[KEY_END_TIME]:
-            finish_ts = self._parse_timestamp(new_value)
-            if finish_ts is None:
-                return
-            if (
-                self._last_finish_ts is not None
-                and abs(finish_ts - self._last_finish_ts)
-                < self.eta_threshold * 60
-            ):
-                return
-            self._schedule_update()
+        if entity_id in {
+            self.entities[KEY_REMAINING_TIME],
+            self.entities[KEY_END_TIME],
+        }:
+            # ETA/end-time changes are intentionally NOT separate push
+            # triggers. The next 1% progress update or one-minute heartbeat
+            # carries the newest ETA. This keeps the Live Activity current
+            # without making every Bambu MQTT change feel like a notification.
             return
 
         if entity_id == self.entities[KEY_SUBTASK_NAME]:
@@ -233,6 +218,17 @@ class BambuLiveActivityRuntime:
                 await asyncio.sleep(delay)
             if self._status() not in ACTIVE_STATES:
                 return
+
+            # Bambu can enter PREPARE/RUNNING before the human task title
+            # arrives. Wait up to 30 seconds so ActivityKit's static title is
+            # the real print name instead of "A1 mini" or a profile ID.
+            for _ in range(15):
+                if self._human_title() is not None:
+                    break
+                await asyncio.sleep(2)
+                if self._status() not in ACTIVE_STATES:
+                    return
+
             await self._async_push_activity(starting=True, force=True)
         except asyncio.CancelledError:
             raise
@@ -351,6 +347,11 @@ class BambuLiveActivityRuntime:
                 "progress": progress,
                 "progress_max": 100,
                 "notification_icon": "mdi:printer-3d",
+                "alert_once": True,
+                "push": {
+                    "sound": "none",
+                    "interruption-level": "passive",
+                },
             },
         }
 
@@ -504,17 +505,14 @@ class BambuLiveActivityRuntime:
         except (AttributeError, KeyError):
             return None
 
-    def _current_title(self) -> str:
-        """Pick a human-readable print title and reject Bambu profile IDs."""
+    def _human_title(self) -> str | None:
+        """Return a human-readable Bambu print title if available."""
         job = self._bambu_print_job()
         candidates: list[Any] = []
 
         if job is not None:
             task_data = getattr(job, "_task_data", None)
             if isinstance(task_data, dict):
-                # The Bambu cloud task list has a human-facing title. Prefer
-                # that over MQTT subtask_name, which can be a profile ID for
-                # some MakerWorld/Bambu Studio jobs.
                 candidates.extend(
                     [
                         task_data.get("title"),
@@ -539,8 +537,14 @@ class BambuLiveActivityRuntime:
             if cleaned is not None:
                 return cleaned
 
-        # The device entry title often includes the serial. Keep the fallback
-        # concise for the Watch Smart Stack.
+        return None
+
+    def _current_title(self) -> str:
+        """Return the human print title, with a concise fallback."""
+        human = self._human_title()
+        if human is not None:
+            return human
+
         if self.entry.title.upper().startswith("A1MINI"):
             return "A1 mini"
         return self.entry.title or "Bambu printer"
