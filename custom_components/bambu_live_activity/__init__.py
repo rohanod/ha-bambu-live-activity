@@ -1,4 +1,4 @@
-"""Bambu Live Activity integration."""
+"""Bambu Print Notifications integration."""
 
 from __future__ import annotations
 
@@ -6,34 +6,23 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 
-from .const import CONF_PRINTER_SERIAL, DOMAIN, REQUIRED_BAMBU_KEYS
-from .helpers import resolve_bambu_entities
-from .runtime import BambuLiveActivityRuntime
+from .const import CONF_PRINTER_SERIAL, DOMAIN
+from .helpers import resolve_print_status_entity
+from .runtime import BambuPrintNotificationsRuntime
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up Bambu Live Activity from a config entry."""
     serial = entry.data[CONF_PRINTER_SERIAL]
-    entities = resolve_bambu_entities(hass, serial)
-
-    missing = REQUIRED_BAMBU_KEYS - entities.keys()
-    if missing:
-        raise ConfigEntryNotReady(
-            "Required ha-bambulab entities are not registered yet: "
-            + ", ".join(sorted(missing))
-        )
-
-    runtime = BambuLiveActivityRuntime(hass, entry)
+    if resolve_print_status_entity(hass, serial) is None:
+        raise ConfigEntryNotReady("ha-bambulab print status entity is not ready")
+    runtime = BambuPrintNotificationsRuntime(hass, entry)
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = runtime
     await runtime.async_start()
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a Bambu Live Activity config entry."""
-    runtime: BambuLiveActivityRuntime | None = hass.data.get(DOMAIN, {}).pop(
-        entry.entry_id, None
-    )
+    runtime: BambuPrintNotificationsRuntime | None = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     if runtime is not None:
-        await runtime.async_stop(clear=True)
+        await runtime.async_stop()
     return True
