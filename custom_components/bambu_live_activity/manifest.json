@@ -1,20 +1,20 @@
 {
   "domain": "bambu_live_activity",
-  "name": "Bambu Print Notifications",
+  "name": "Bambu Live Activity",
   "after_dependencies": [
     "bambu_lab"
   ],
   "codeowners": [
-    "@OWNER"
+    "@rohanod"
   ],
   "config_flow": true,
   "dependencies": [
     "mobile_app"
   ],
-  "documentation": "https://github.com/OWNER/ha-bambu-live-activity",
+  "documentation": "https://github.com/rohanod/ha-bambu-live-activity",
   "integration_type": "service",
   "iot_class": "local_push",
-  "issue_tracker": "https://github.com/OWNER/ha-bambu-live-activity/issues",
+  "issue_tracker": "https://github.com/rohanod/ha-bambu-live-activity/issues",
   "requirements": [],
-  "version": "0.1.5"
+  "version": "0.1.6"
 }

@@ -1,10 +1,10 @@
 {
-  "title": "Bambu Print Notifications",
+  "title": "Bambu Live Activity",
   "config": {
     "step": {
       "user": {
-        "title": "Set up Bambu Print Notifications",
-        "description": "Send one notification when a Bambu print actually finishes.",
+        "title": "Set up Bambu Live Activity",
+        "description": "Track Bambu prints as a quiet Live Activity, and notify when a print finishes.",
         "data": {
           "printer_device": "Bambu printer",
           "notify_service": "iPhone notification action"

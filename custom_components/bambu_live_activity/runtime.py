@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from pathlib import PurePath
-import re
+import logging
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -13,13 +12,8 @@ from homeassistant.helpers import entity_registry as er
 
 from .const import BAMBU_DOMAIN, CONF_NOTIFY_SERVICE, CONF_PRINTER_SERIAL
 from .helpers import resolve_print_status_entity
-
-_BAD_TITLE_PATTERNS = (
-    re.compile(r"^\d+#profileid[-_#]", re.IGNORECASE),
-    re.compile(r"^profileid[-_#]", re.IGNORECASE),
-    re.compile(r"^\d{6,}$"),
-)
-
+from .live_activity import PrintLiveActivity
+from .model_names import clean_title, title_from_job
 
 class BambuPrintNotificationsRuntime:
     """Send exactly one completion notification per real completed print."""
@@ -40,16 +34,24 @@ class BambuPrintNotificationsRuntime:
         self.config_entry_id = status_entry.config_entry_id if status_entry is not None else None
         self._unsub = None
         self._completion_handled = False
+        self.live_activity = PrintLiveActivity(
+            hass,
+            self.serial,
+            self._human_model_name,
+            self._async_mobile_notify,
+        )
 
     async def async_start(self) -> None:
         self._unsub = self.hass.bus.async_listen(
             f"{BAMBU_DOMAIN}_event", self._handle_bambu_event
         )
+        await self.live_activity.async_start()
 
     async def async_stop(self) -> None:
         if self._unsub is not None:
             self._unsub()
             self._unsub = None
+        await self.live_activity.async_stop()
 
     @callback
     def _handle_bambu_event(self, event: Event) -> None:
@@ -59,6 +61,10 @@ class BambuPrintNotificationsRuntime:
         event_type = event.data.get("type")
         if event_type == "event_print_started":
             self._completion_handled = False
+            self.live_activity.on_print_started()
+            return
+        if event_type in {"event_print_failed", "event_print_canceled"}:
+            self.hass.async_create_task(self.live_activity.async_finish())
             return
         if event_type != "event_print_finished" or self._completion_handled:
             return
@@ -67,16 +73,22 @@ class BambuPrintNotificationsRuntime:
         self.hass.async_create_task(self._async_notify_finished())
 
     async def _async_notify_finished(self) -> None:
-        model_name = self._current_model_name()
+        model_name = self._human_model_name() or self.live_activity.activity_title or "A1 mini"
+        await self.live_activity.async_finish()
 
-        await self._async_mobile_notify({
-            "title": model_name,
-            "message": "Finished printing.",
-            "data": {
-                "notification_icon": "mdi:printer-3d",
-                "tag": f"bambu_print_finished_{self.serial[-8:]}",
-            },
-        })
+        try:
+            await self._async_mobile_notify({
+                "title": model_name,
+                "message": "Finished printing.",
+                "data": {
+                    "notification_icon": "mdi:printer-3d",
+                    "tag": f"bambu_print_finished_{self.serial[-8:]}",
+                },
+            })
+        except Exception:
+            # The HA notification must still appear if APNs/mobile notify is
+            # temporarily unavailable.
+            logging.getLogger(__name__).exception("Mobile print-finished notification failed")
 
         await self.hass.services.async_call(
             "persistent_notification",
@@ -89,28 +101,18 @@ class BambuPrintNotificationsRuntime:
             blocking=True,
         )
 
-    def _current_model_name(self) -> str:
+    def _human_model_name(self) -> str | None:
+        """Prefer an actual print filename over generic Bambu plate labels."""
         job = self._bambu_print_job()
-        candidates: list[Any] = []
+        # For the current A1 mini, this is the real model filename even when
+        # the Bambu Cloud task title just says "1 piece".
+        task_entity = self.live_activity.entities.get("subtask_name")
+        state = self.hass.states.get(task_entity) if task_entity else None
+        task_name = state.state if state is not None else None
+        return title_from_job(job, task_name)
 
-        if job is not None:
-            task_data = getattr(job, "_task_data", None)
-            if isinstance(task_data, dict):
-                candidates.extend([
-                    task_data.get("designTitle"),
-                    task_data.get("title"),
-                    task_data.get("plateName"),
-                ])
-            candidates.extend([
-                getattr(job, "subtask_name", None),
-                getattr(job, "gcode_file", None),
-            ])
-
-        for candidate in candidates:
-            cleaned = self._clean_title(candidate)
-            if cleaned is not None:
-                return cleaned
-        return "A1 mini"
+    def _current_model_name(self) -> str:
+        return self._human_model_name() or "A1 mini"
 
     def _bambu_print_job(self) -> Any | None:
         if self.config_entry_id is None:
@@ -145,27 +147,4 @@ class BambuPrintNotificationsRuntime:
 
     @staticmethod
     def _clean_title(value: Any) -> str | None:
-        text = BambuPrintNotificationsRuntime._clean_text(value)
-        if text is None:
-            return None
-        text = text.replace("\\", "/")
-        if "/" in text:
-            text = PurePath(text).name
-        lower = text.lower()
-        for suffix in (".gcode.3mf", ".gcode", ".3mf"):
-            if lower.endswith(suffix):
-                text = text[:-len(suffix)].strip()
-                break
-        if not text:
-            return None
-        for pattern in _BAD_TITLE_PATTERNS:
-            if pattern.search(text):
-                return None
-        marker = re.search(r"#profileid[-_#]", text, re.IGNORECASE)
-        if marker:
-            useful = text[:marker.start()].strip(" _-#")
-            if useful and not useful.isdigit():
-                text = useful
-            else:
-                return None
-        return text[:100]
+        return clean_title(value)
