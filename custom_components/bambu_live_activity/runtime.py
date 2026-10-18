@@ -64,9 +64,14 @@ class BambuPrintNotificationsRuntime:
             self.live_activity.on_print_started()
             return
         if event_type in {"event_print_failed", "event_print_canceled"}:
+            self.live_activity.consume_print_seen()
             self.hass.async_create_task(self.live_activity.async_finish())
             return
         if event_type != "event_print_finished" or self._completion_handled:
+            return
+        # ha-bambulab can replay a finish event (MQTT reconnect, HA restart)
+        # long after the print; only alert for a print we watched run.
+        if not self.live_activity.consume_print_seen():
             return
 
         self._completion_handled = True

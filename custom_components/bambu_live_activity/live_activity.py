@@ -107,6 +107,8 @@ class PrintLiveActivity:
         self._last_payload: tuple[Any, ...] | None = None
         self._next_rollover_at = 0.0
         self._retry_unsub: Any | None = None
+        # True once this run has seen the printer actually printing.
+        self._print_seen = False
 
     @property
     def activity_title(self) -> str | None:
@@ -122,7 +124,13 @@ class PrintLiveActivity:
             self._on_change,
         )
         if self._state("print_status") in ACTIVE_STATES:
+            self._print_seen = True
             self._start_new_activity()
+
+    def consume_print_seen(self) -> bool:
+        """True once per observed print; blocks replayed/stale finish events."""
+        seen, self._print_seen = self._print_seen, False
+        return seen
 
     async def async_stop(self) -> None:
         if self._unsub is not None:
@@ -151,6 +159,7 @@ class PrintLiveActivity:
             status = str(new.state).lower()
             old_status = str(old.state).lower() if old else ""
             if status in ACTIVE_STATES:
+                self._print_seen = True
                 if not self._active and (self._start_task is None or self._start_task.done()):
                     self._start_new_activity()
                 elif self._active and old_status != status:

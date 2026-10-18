@@ -23,7 +23,7 @@ cone-customised                   9m
 - **Frequency:** when a full percentage point changes (with a 15-second minimum interval to avoid bursts), or after 60 seconds without another push. Additional MQTT fields are combined into one update.
 - **Remaining time:** derived from valid printer end time when possible; otherwise read from Bambu's remaining-time sensor with unit conversion (hours/minutes).
 - **Long prints:** renew once at about 7½ hours, before Apple's 8-hour activity limit.
-- **Completion:** a genuine `bambu_lab_event`/`event_print_finished` triggers one ordinary iPhone/Watch notification **and** one Home Assistant persistent notification. A stale `finish` state never triggers a completion alert.
+- **Completion:** a genuine `bambu_lab_event`/`event_print_finished` triggers one ordinary iPhone/Watch notification **and** one Home Assistant persistent notification. A stale `finish` state or a replayed finish event (e.g. after a reconnect or restart) never triggers an alert: only prints this integration saw running do.
 
 *Important:* Home Assistant's Companion App says quiet updates use lower push priority and iOS may delay or throttle them outside Local Push. The initial Live Activity may still generate one alert; subsequent updates are silent. iOS also applies an independent push-to-start budget. This integration cannot bypass Apple's limits.
 
