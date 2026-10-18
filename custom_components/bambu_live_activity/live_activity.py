@@ -37,6 +37,45 @@ def resolve_progress_entities(hass: HomeAssistant, serial: str) -> dict[str, str
     return result
 
 
+# Per-state look: (accent for icon + bar, Lock Screen card, status word).
+STYLES = {
+    "running": ("#3DDC84", "#0B1A12", "Printing"),
+    "pause": ("#FFB84D", "#1F1606", "Paused"),
+    "prepare": ("#7FA8FF", "#0C1322", "Preparing"),
+    "slicing": ("#7FA8FF", "#0C1322", "Preparing"),
+}
+
+
+def build_payload(
+    tag: str, title: str, status: str, progress: int, rem_text: str, finish_text: str, starting: bool
+) -> dict[str, Any]:
+    accent, card, word = STYLES.get(status, STYLES["running"])
+    if status == "running":
+        message = f"{finish_text} finish"  # short: Watch Smart Stack truncates long lines
+    elif status == "pause":
+        message = f"{word} at {progress}%"
+    else:
+        message = f"{word}…"
+    data: dict[str, Any] = {
+        "tag": tag,
+        "live_update": True,
+        "progress": progress,
+        "progress_max": 100,
+        # Compact view (Dynamic Island, Watch): keep it to one short token.
+        "critical_text": "Paused" if status == "pause" else "Prep" if status in ("prepare", "slicing") else rem_text,
+        "alert_once": True,
+        "notification_icon": "mdi:printer-pause" if status == "pause" else "mdi:printer-3d-nozzle",
+        "notification_icon_color": accent,
+        "progress_bar_color": accent,
+        "background_color": card,
+        "text_color": "#F2F5F3",
+    }
+    # Updates are quiet; the initial push may alert once.
+    if not starting:
+        data["silent"] = True
+    return {"title": title, "message": message, "data": data}
+
+
 class PrintLiveActivity:
     """Keep one Live Activity updated without repeated banners/vibrations."""
 
@@ -250,23 +289,9 @@ class PrintLiveActivity:
             if not force and self._last_payload == data_key:
                 return
 
-            payload = {
-                "title": title,
-                "message": f"{progress}% · {finish_text}",
-                "data": {
-                    "tag": self.tag,
-                    "live_update": True,
-                    "progress": progress,
-                    "progress_max": 100,
-                    "critical_text": rem_text,
-                    "alert_once": True,
-                    "notification_icon": "mdi:printer-3d",
-                },
-            }
-            # HA Companion docs: silent/alert_once are supported for updates.
-            # Keep a normal completion alert in the other runtime, not here.
-            if not starting:
-                payload["data"]["silent"] = True
+            payload = build_payload(
+                self.tag, title, self._state("print_status"), progress, rem_text, finish_text, starting
+            )
             try:
                 await self.notify(payload)
             except Exception:
@@ -287,6 +312,17 @@ class PrintLiveActivity:
             self._schedule_heartbeat()
             if starting:
                 self._schedule_rollover()
+
+    async def async_demo(self) -> None:
+        """Play a short fake print on its own tag so users can preview the look."""
+        tag = f"{self.tag}_test"
+        steps = [("prepare", 0, "12m"), ("running", 20, "10m"), ("running", 55, "5m"),
+                 ("pause", 55, "5m"), ("running", 80, "2m"), ("running", 100, "1m")]
+        finish = dt_util.now().strftime("%H:%M")
+        for i, (status, progress, rem) in enumerate(steps):
+            await self.notify(build_payload(tag, "Test print", status, progress, rem, finish, i == 0))
+            await asyncio.sleep(4)
+        await self.notify({"message": "clear_notification", "data": {"tag": tag}})
 
     async def _async_clear(self) -> None:
         self._generation += 1

@@ -23,5 +23,12 @@
     "abort": {
       "already_configured": "This Bambu printer is already configured."
     }
+  },
+  "entity": {
+    "button": {
+      "test_live_activity": {
+        "name": "Test Live Activity"
+      }
+    }
   }
 }

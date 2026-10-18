@@ -16,6 +16,7 @@ cone-customised                   9m
 ██████████░░░░
 ```
 
+- **Apple Watch:** iOS 18+ mirrors the activity to the Watch Smart Stack automatically. Text is kept short (title, "16:26 finish", remaining time) so it stays readable there.
 - **Human-readable model name:** uses the actual Bambu task/filename (e.g. `cone-customised.gcode.3mf` → `cone-customised`), rejecting stale profile IDs and generic text such as `1 piece`.
 - **Progress and ETA:** a current percentage, estimated finish time, remaining-time text, and progress bar.
 - **Quiet updates:** same stable `tag`, `alert_once: true`, and `silent: true` on updates. One Live Activity is retained for the whole print; title changes do not restart it.
@@ -25,6 +26,10 @@ cone-customised                   9m
 - **Completion:** a genuine `bambu_lab_event`/`event_print_finished` triggers one ordinary iPhone/Watch notification **and** one Home Assistant persistent notification. A stale `finish` state never triggers a completion alert.
 
 *Important:* Home Assistant's Companion App says quiet updates use lower push priority and iOS may delay or throttle them outside Local Push. The initial Live Activity may still generate one alert; subsequent updates are silent. iOS also applies an independent push-to-start budget. This integration cannot bypass Apple's limits.
+
+## Preview
+
+Press **Test Live Activity** on the integration's device page to play a ~25 s fake print (prepare → running → paused → running → done) on a separate tag. Repeated tests count against iOS's Live Activity push budget.
 
 ## Install
 
