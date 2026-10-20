@@ -24,10 +24,55 @@
       "already_configured": "This Bambu printer is already configured."
     }
   },
-  "entity": {
-    "button": {
-      "test_live_activity": {
-        "name": "Test Live Activity"
+  "services": {
+    "test_activity": {
+      "name": "Test Live Activity",
+      "description": "Play a ~25 s sample print on a separate Live Activity.",
+      "fields": {
+        "entry_id": {
+          "name": "Printer",
+          "description": "Leave empty to use every configured printer."
+        }
+      }
+    },
+    "restart_activity": {
+      "name": "Restart Live Activity",
+      "description": "Reopen the Live Activity for the running print, e.g. after it was swiped away.",
+      "fields": {
+        "entry_id": {
+          "name": "Printer",
+          "description": "Leave empty to use every configured printer."
+        }
+      }
+    },
+    "end_activity": {
+      "name": "End Live Activity",
+      "description": "End the print and test Live Activities on the iPhone.",
+      "fields": {
+        "entry_id": {
+          "name": "Printer",
+          "description": "Leave empty to use every configured printer."
+        }
+      }
+    },
+    "test_finished_notification": {
+      "name": "Test finished notification",
+      "description": "Send a sample print-finished notification to the iPhone and Home Assistant.",
+      "fields": {
+        "entry_id": {
+          "name": "Printer",
+          "description": "Leave empty to use every configured printer."
+        }
+      }
+    },
+    "get_status": {
+      "name": "Get status",
+      "description": "Return the Live Activity state and recent pushes for debugging.",
+      "fields": {
+        "entry_id": {
+          "name": "Printer",
+          "description": "Leave empty to use every configured printer."
+        }
       }
     }
   }

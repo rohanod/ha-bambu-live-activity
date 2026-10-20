@@ -9,11 +9,15 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
+from homeassistant.util import dt as dt_util
 
 from .const import BAMBU_DOMAIN, CONF_NOTIFY_SERVICE, CONF_PRINTER_SERIAL
 from .helpers import resolve_print_status_entity
 from .live_activity import PrintLiveActivity
 from .model_names import clean_title, title_from_job
+
+FINISHED_COLOR = "#3DDC84"
+
 
 class BambuPrintNotificationsRuntime:
     """Send exactly one completion notification per real completed print."""
@@ -80,14 +84,23 @@ class BambuPrintNotificationsRuntime:
     async def _async_notify_finished(self) -> None:
         model_name = self._human_model_name() or self.live_activity.activity_title or "A1 mini"
         await self.live_activity.async_finish()
+        await self.async_send_finished(model_name)
 
+    async def async_send_finished(self, model_name: str) -> None:
+        """Send the phone + Home Assistant finished notifications."""
+        message = f"Finished at {dt_util.now().strftime('%H:%M')}"
         try:
             await self._async_mobile_notify({
                 "title": model_name,
-                "message": "Finished printing.",
+                "message": message,
                 "data": {
-                    "notification_icon": "mdi:printer-3d",
                     "tag": f"bambu_print_finished_{self.serial[-8:]}",
+                    # Same green + printer icon as the Live Activity.
+                    "notification_icon": "mdi:printer-3d-nozzle",
+                    "notification_icon_color": FINISHED_COLOR,
+                    "color": FINISHED_COLOR,
+                    # iOS: group with the print's other notifications.
+                    "push": {"thread-id": f"bambu_print_{self.serial[-8:]}"},
                 },
             })
         except Exception:
@@ -100,7 +113,7 @@ class BambuPrintNotificationsRuntime:
             "create",
             {
                 "title": model_name,
-                "message": "Finished printing.",
+                "message": message,
                 "notification_id": f"bambu_print_finished_{self.serial[-8:]}",
             },
             blocking=True,

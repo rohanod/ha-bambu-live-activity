@@ -27,9 +27,25 @@ cone-customised                   9m
 
 *Important:* Home Assistant's Companion App says quiet updates use lower push priority and iOS may delay or throttle them outside Local Push. The initial Live Activity may still generate one alert; subsequent updates are silent. iOS also applies an independent push-to-start budget. This integration cannot bypass Apple's limits.
 
-## Preview
+## Debug actions
 
-Press **Test Live Activity** on the integration's device page to play a ~25 s fake print (prepare → running → paused → running → done) on a separate tag. Repeated tests count against iOS's Live Activity push budget.
+Run these from **Developer tools → Actions** (or any script). All take an optional `entry_id` (printer); empty means every printer.
+
+| Action | Does |
+|---|---|
+| `bambu_live_activity.test_activity` | Plays a ~25 s fake print on a separate tag. Uses iOS's push budget, so don't spam it. |
+| `bambu_live_activity.restart_activity` | Reopens the Live Activity for the running print right now (e.g. after you swiped it away). |
+| `bambu_live_activity.end_activity` | Ends the print and test Live Activities on the iPhone, even if the integration thinks none is open. |
+| `bambu_live_activity.test_finished_notification` | Sends a sample finished notification ("Test print", "Finished at HH:MM"). |
+| `bambu_live_activity.get_status` | Returns state, start count and the last 25 pushes. Check this if duplicates appear: more than one `START` per print means Home Assistant sent them. |
+
+The old *Test Live Activity* button entity is gone; delete its leftover unavailable entity in **Settings → Devices & services → Entities**.
+
+## Duplicate protection
+
+- Every push for a printer uses one `tag`; an update never opens a new activity unless the previous one was ended.
+- Reloading or restarting Home Assistant does **not** end the activity; it keeps updating the same one.
+- A brief `idle`/`finish` status flap must last 30 s before the activity is ended, and fresh starts are limited to one per 2 minutes per printer.
 
 ## Install
 

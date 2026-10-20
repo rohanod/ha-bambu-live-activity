@@ -1,0 +1,35 @@
+test_activity:
+  fields:
+    entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: bambu_live_activity
+restart_activity:
+  fields:
+    entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: bambu_live_activity
+end_activity:
+  fields:
+    entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: bambu_live_activity
+test_finished_notification:
+  fields:
+    entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: bambu_live_activity
+get_status:
+  fields:
+    entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: bambu_live_activity

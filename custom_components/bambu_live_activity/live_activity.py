@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from datetime import datetime
 import logging
 import math
 from typing import Any, Awaitable, Callable
 
 from homeassistant.core import Event, HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 from homeassistant.util import dt as dt_util
@@ -24,6 +26,11 @@ MIN_UPDATE_INTERVAL = 15.0
 HEARTBEAT_SECONDS = 60.0
 NAME_WAIT_SECONDS = 30.0
 LONG_PRINT_ROLLOVER_SECONDS = 7.5 * 60 * 60
+# A stopped status must hold this long before the activity is ended, so a
+# brief idle/finish flap cannot end + restart (= a second activity on device).
+STOP_DEBOUNCE_SECONDS = 30.0
+# Fresh start pushes are capped per printer; further requests wait it out.
+MIN_START_INTERVAL = 120.0
 
 
 def resolve_progress_entities(hass: HomeAssistant, serial: str) -> dict[str, str]:
@@ -109,6 +116,16 @@ class PrintLiveActivity:
         self._retry_unsub: Any | None = None
         # True once this run has seen the printer actually printing.
         self._print_seen = False
+        self._stop_unsub: Any | None = None
+        # A start push may have reached the phone even if we never saw success.
+        self._maybe_open = False
+        self._last_start_at: float | None = None
+        self._demo_lock = asyncio.Lock()
+        self.starts = 0
+        self.history: deque[str] = deque(maxlen=25)
+
+    def _log(self, event: str) -> None:
+        self.history.append(f"{dt_util.now().strftime('%m-%d %H:%M:%S')} {event}")
 
     @property
     def activity_title(self) -> str | None:
@@ -136,7 +153,9 @@ class PrintLiveActivity:
         if self._unsub is not None:
             self._unsub()
             self._unsub = None
-        await self._async_clear()
+        # No clear here: a reload/restart must not end the activity, or the
+        # restart creates a second one. The same tag is simply updated again.
+        self._cancel_work()
 
     @callback
     def on_print_started(self) -> None:
@@ -146,6 +165,38 @@ class PrintLiveActivity:
 
     async def async_finish(self) -> None:
         await self._async_clear()
+
+    async def async_end(self) -> None:
+        """Debug: end the real and test activities on the phone, even if unsure."""
+        self._maybe_open = True
+        await self._async_clear()
+        await self.notify({"message": "clear_notification", "data": {"tag": f"{self.tag}_test"}})
+
+    async def async_restart(self) -> None:
+        """Debug: (re)open the activity now, e.g. after it was swiped away."""
+        if self._state("print_status") not in ACTIVE_STATES:
+            raise HomeAssistantError("No print is running, so there is nothing to restart")
+        self._cancel_work()
+        self._active = False
+        self._title = None
+        self._print_seen = True
+        self._start_new_activity(force=True)
+
+    def snapshot(self) -> dict[str, Any]:
+        loop_now = asyncio.get_running_loop().time()
+        return {
+            "tag": self.tag,
+            "print_status": self._state("print_status"),
+            "progress": self._progress(),
+            "activity_open": self._active,
+            "title": self._title,
+            "starts_since_reload": self.starts,
+            "seconds_since_last_push": round(loop_now - self._last_push_at) if self._last_push_at else None,
+            "seconds_since_last_start": round(loop_now - self._last_start_at) if self._last_start_at else None,
+            "stop_pending": self._stop_unsub is not None,
+            "entities": self.entities,
+            "recent": list(self.history),
+        }
 
     @callback
     def _on_change(self, event: Event) -> None:
@@ -164,8 +215,9 @@ class PrintLiveActivity:
                     self._start_new_activity()
                 elif self._active and old_status != status:
                     self._schedule_update(urgent=True)
+                self._cancel_timer("_stop_unsub")
             elif status in STOPPED_STATES:
-                self.hass.async_create_task(self._async_clear())
+                self._schedule_stop()
             return
 
         if not self._active or self._state("print_status") not in ACTIVE_STATES:
@@ -178,19 +230,32 @@ class PrintLiveActivity:
         # the next percentage change or minute refresh carries the newest ETA.
 
     @callback
-    def _start_new_activity(self) -> None:
+    def _schedule_stop(self) -> None:
+        if self._stop_unsub is not None or not (self._active or self._maybe_open or self._start_task):
+            return
+
+        @callback
+        def tick(_: datetime) -> None:
+            self._stop_unsub = None
+            if self._state("print_status") in STOPPED_STATES:
+                self.hass.async_create_task(self._async_clear())
+
+        self._stop_unsub = async_call_later(self.hass, STOP_DEBOUNCE_SECONDS, tick)
+
+    @callback
+    def _start_new_activity(self, *, force: bool = False) -> None:
         if self._active or (self._start_task and not self._start_task.done()):
             return
         self._generation += 1
         gen = self._generation
-        self._start_task = self.hass.async_create_task(self._async_begin(gen))
+        self._start_task = self.hass.async_create_task(self._async_begin(gen, force))
 
-    async def _async_begin(self, gen: int) -> None:
+    async def _async_begin(self, gen: int, force: bool = False) -> None:
         """Wait briefly for a real model name before setting the static title."""
         try:
             # Bambu may still expose the PREVIOUS model name/progress on its
             # initial PREPARE update. Allow fresh MQTT metadata to arrive.
-            await asyncio.sleep(6)
+            await asyncio.sleep(1 if force else 6)
             for _ in range(int((NAME_WAIT_SECONDS - 6) / 2)):
                 if gen != self._generation or self._state("print_status") not in ACTIVE_STATES:
                     return
@@ -205,6 +270,13 @@ class PrintLiveActivity:
                 self._retry_start_later()
                 return
             self._title = self.get_name() or "A1 mini"
+            if not force and self._last_start_at is not None:
+                wait = MIN_START_INTERVAL - (asyncio.get_running_loop().time() - self._last_start_at)
+                if wait > 0:
+                    self._log(f"start delayed {wait:.0f}s (rate limit)")
+                    await asyncio.sleep(wait)
+                    if gen != self._generation or self._state("print_status") not in ACTIVE_STATES:
+                        return
             await self._async_push(starting=True, force=True)
         except asyncio.CancelledError:
             raise
@@ -275,12 +347,14 @@ class PrintLiveActivity:
             return
         await self._async_clear()
         if self._state("print_status") in ACTIVE_STATES:
-            self._start_new_activity()
+            self._start_new_activity(force=True)  # planned renewal, not a flap
 
     async def _async_push(self, *, starting: bool = False, force: bool = False) -> None:
         async with self._push_lock:
             if self._state("print_status") not in ACTIVE_STATES:
                 return
+            if not starting and not self._active:
+                return  # queued update from before a clear; would reopen a closed activity
             progress = self._progress()
             end_timestamp = self._valid_end_timestamp()
             remaining = self._remaining_minutes(end_timestamp)
@@ -301,10 +375,17 @@ class PrintLiveActivity:
             payload = build_payload(
                 self.tag, title, self._state("print_status"), progress, rem_text, finish_text, starting
             )
+            if starting:
+                self._maybe_open = True
+                self._last_start_at = asyncio.get_running_loop().time()
+                self.starts += 1
             try:
                 await self.notify(payload)
             except Exception:
                 _LOGGER.exception("Failed to update Bambu Live Activity")
+                self._log(f"{'start' if starting else 'update'} FAILED")
+                if starting:
+                    self._maybe_open = False
                 if self._state("print_status") in ACTIVE_STATES:
                     if starting:
                         self._retry_start_later()
@@ -313,6 +394,7 @@ class PrintLiveActivity:
                         # mobile notifications temporarily fail.
                         self._schedule_heartbeat()
                 return
+            self._log(f"{'START' if starting else 'update'} {progress}% {self._state('print_status')}")
             self._active = True
             self._title = title
             self._last_payload = data_key
@@ -324,7 +406,14 @@ class PrintLiveActivity:
 
     async def async_demo(self) -> None:
         """Play a short fake print on its own tag so users can preview the look."""
+        if self._demo_lock.locked():
+            raise HomeAssistantError("A test activity is already playing")
+        async with self._demo_lock:
+            await self._play_demo()
+
+    async def _play_demo(self) -> None:
         tag = f"{self.tag}_test"
+        self._log("test activity")
         steps = [("prepare", 0, "12m"), ("running", 20, "10m"), ("running", 55, "5m"),
                  ("pause", 55, "5m"), ("running", 80, "2m"), ("running", 100, "1m")]
         finish = dt_util.now().strftime("%H:%M")
@@ -333,23 +422,27 @@ class PrintLiveActivity:
             await asyncio.sleep(4)
         await self.notify({"message": "clear_notification", "data": {"tag": tag}})
 
-    async def _async_clear(self) -> None:
+    @callback
+    def _cancel_work(self) -> None:
         self._generation += 1
         task = self._start_task
         if task is not None and task is not asyncio.current_task() and not task.done():
             task.cancel()
         self._start_task = None
-        self._cancel_timer("_update_unsub")
-        self._cancel_timer("_heartbeat_unsub")
-        self._cancel_timer("_rollover_unsub")
-        self._cancel_timer("_retry_unsub")
+        for attr in ("_update_unsub", "_heartbeat_unsub", "_rollover_unsub", "_retry_unsub", "_stop_unsub"):
+            self._cancel_timer(attr)
+
+    async def _async_clear(self) -> None:
+        self._cancel_work()
         async with self._push_lock:
-            if self._active:
+            if self._active or self._maybe_open:
                 try:
                     await self.notify({"message": "clear_notification", "data": {"tag": self.tag}})
+                    self._log("clear")
                 except Exception:
                     _LOGGER.warning("Unable to clear Bambu Live Activity", exc_info=True)
             self._active = False
+            self._maybe_open = False
             self._title = None
             self._last_payload = None
             self._last_progress = None

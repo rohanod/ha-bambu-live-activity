@@ -16,4 +16,5 @@ HACS installs from git tags/releases, so every user-visible change ships as a ne
 Notes:
 - Do not commit inside the sandbox; ask for out-of-sandbox permission for git writes.
 - Keep the config-entry domain `bambu_live_activity` and the Live Activity `tag` stable so existing installs update in place.
-- The Test Live Activity button uses a separate `_test` tag and counts against iOS's push budget; don't automate it.
+- The `test_activity` action uses a separate `_test` tag and counts against iOS's push budget; don't automate it.
+- Never end (`clear_notification`) and restart an activity for transient state; every end + start can leave an extra activity on devices (Mac mirrors them). Use `get_status` to inspect.
