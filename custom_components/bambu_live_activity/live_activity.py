@@ -13,17 +13,18 @@ from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
+from homeassistant.helpers.storage import Store
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.util import dt as dt_util
 
-from .const import BAMBU_DOMAIN
+from .const import BAMBU_DOMAIN, DOMAIN, dashboard_path
 
 _LOGGER = logging.getLogger(__name__)
 
 ACTIVE_STATES = {"prepare", "running", "pause", "slicing"}
 STOPPED_STATES = {"finish", "failed", "idle"}
 COALESCE_SECONDS = 2.0
-MIN_UPDATE_INTERVAL = 15.0
-HEARTBEAT_SECONDS = 60.0
+MIN_UPDATE_INTERVAL = 600.0
 NAME_WAIT_SECONDS = 30.0
 LONG_PRINT_ROLLOVER_SECONDS = 7.5 * 60 * 60
 # A stopped status must hold this long before the activity is ended, so a
@@ -92,26 +93,30 @@ class PrintLiveActivity:
         serial: str,
         get_name: Callable[[], str | None],
         notify: Callable[[dict[str, Any]], Awaitable[None]],
+        options: dict[str, Any] | None = None,
     ) -> None:
         self.hass = hass
         self.serial = serial
         self.get_name = get_name
         self.notify = notify
+        self.options = options or {}
+        self._store = Store(hass, 1, f"bambu_live_activity.{serial}")
+        self._last_eta: float | None = None
+        self._started_at = 0.0
+        self._last_attempt_at = 0.0
         self.entities = resolve_progress_entities(hass, serial)
         # Same tag as 0.1.4, so it updates rather than multiplying activities.
         self.tag = f"bambu_print_{''.join(c for c in serial if c.isalnum())[-16:]}"
         self._unsub: Any | None = None
         self._update_unsub: Any | None = None
-        self._heartbeat_unsub: Any | None = None
         self._rollover_unsub: Any | None = None
         self._start_task: asyncio.Task | None = None
         self._push_lock = asyncio.Lock()
         self._generation = 0
         self._active = False
+        self._stopped = False
         self._title: str | None = None
         self._last_push_at = 0.0
-        self._last_progress: int | None = None
-        self._last_payload: tuple[Any, ...] | None = None
         self._next_rollover_at = 0.0
         self._retry_unsub: Any | None = None
         # True once this run has seen the printer actually printing.
@@ -135,6 +140,15 @@ class PrintLiveActivity:
         if "print_status" not in self.entities or "print_progress" not in self.entities:
             _LOGGER.warning("Missing Bambu print status/progress sensors; Live Activity disabled")
             return
+        saved = await self._store.async_load() or {}
+        self._active = self._maybe_open = bool(saved.get("active"))
+        self._title = saved.get("title")
+        self._last_push_at = saved.get("last_push_at", 0.0)
+        self._last_eta = saved.get("last_eta")
+        self._started_at = saved.get("started_at", 0.0)
+        self._last_attempt_at = saved.get("last_attempt_at", 0.0)
+        self._last_start_at = saved.get("last_start_at")
+        self._print_seen = bool(saved.get("print_seen"))
         self._unsub = async_track_state_change_event(
             self.hass,
             list(self.entities.values()),
@@ -142,7 +156,26 @@ class PrintLiveActivity:
         )
         if self._state("print_status") in ACTIVE_STATES:
             self._print_seen = True
-            self._start_new_activity()
+            if self._active:
+                self._schedule_rollover()
+                self._schedule_update()
+            else:
+                self._start_new_activity()
+        elif self._state("print_status") in STOPPED_STATES:
+            self._schedule_stop()
+
+    async def _async_save(self) -> None:
+        await self._store.async_save({
+            "active": self._active or self._maybe_open,
+            "title": self._title,
+            "last_push_at": self._last_push_at,
+            "last_eta": self._last_eta,
+            "started_at": self._started_at,
+            "last_attempt_at": self._last_attempt_at,
+            "last_start_at": self._last_start_at,
+            "print_seen": self._print_seen,
+        })
+        async_dispatcher_send(self.hass, f"{DOMAIN}_{self.serial}_updated")
 
     def consume_print_seen(self) -> bool:
         """True once per observed print; blocks replayed/stale finish events."""
@@ -150,18 +183,27 @@ class PrintLiveActivity:
         return seen
 
     async def async_stop(self) -> None:
+        self._stopped = True
         if self._unsub is not None:
             self._unsub()
             self._unsub = None
         # No clear here: a reload/restart must not end the activity, or the
         # restart creates a second one. The same tag is simply updated again.
+        task = self._start_task
         self._cancel_work()
+        if task is not None and task is not asyncio.current_task():
+            await asyncio.gather(task, return_exceptions=True)
+        # Drain an in-flight notify/save before another runtime restores state.
+        async with self._push_lock:
+            pass
 
     @callback
     def on_print_started(self) -> None:
         """Called by the existing ha-bambulab lifecycle event listener."""
-        if self._state("print_status") in ACTIVE_STATES and not self._active:
-            self._start_new_activity()
+        if self._state("print_status") in ACTIVE_STATES:
+            self._print_seen = True
+            if not self._active:
+                self._start_new_activity()
 
     async def async_finish(self) -> None:
         await self._async_clear()
@@ -183,7 +225,7 @@ class PrintLiveActivity:
         self._start_new_activity(force=True)
 
     def snapshot(self) -> dict[str, Any]:
-        loop_now = asyncio.get_running_loop().time()
+        loop_now = dt_util.now().timestamp()
         return {
             "tag": self.tag,
             "print_status": self._state("print_status"),
@@ -193,6 +235,10 @@ class PrintLiveActivity:
             "starts_since_reload": self.starts,
             "seconds_since_last_push": round(loop_now - self._last_push_at) if self._last_push_at else None,
             "seconds_since_last_start": round(loop_now - self._last_start_at) if self._last_start_at else None,
+            "last_published_eta": self._last_eta,
+            "last_successful_update": self._last_push_at or None,
+            "drift_threshold_seconds": self.options.get("eta_drift_minutes", 3) * 60,
+            "update_pending": self._update_unsub is not None,
             "stop_pending": self._stop_unsub is not None,
             "entities": self.entities,
             "recent": list(self.history),
@@ -202,19 +248,17 @@ class PrintLiveActivity:
     def _on_change(self, event: Event) -> None:
         entity_id = event.data.get("entity_id")
         new = event.data.get("new_state")
-        old = event.data.get("old_state")
         if new is None:
             return
 
         if entity_id == self.entities.get("print_status"):
             status = str(new.state).lower()
-            old_status = str(old.state).lower() if old else ""
             if status in ACTIVE_STATES:
                 self._print_seen = True
                 if not self._active and (self._start_task is None or self._start_task.done()):
                     self._start_new_activity()
-                elif self._active and old_status != status:
-                    self._schedule_update(urgent=True)
+                elif self._active:
+                    self._schedule_update()
                 self._cancel_timer("_stop_unsub")
             elif status in STOPPED_STATES:
                 self._schedule_stop()
@@ -222,12 +266,9 @@ class PrintLiveActivity:
 
         if not self._active or self._state("print_status") not in ACTIVE_STATES:
             return
-        if entity_id == self.entities.get("print_progress"):
-            progress = self._progress()
-            if self._last_progress is None or progress != self._last_progress:
-                self._schedule_update()
-        # ETA and remaining-time sensor changes do not start their own push;
-        # the next percentage change or minute refresh carries the newest ETA.
+        if entity_id == self.entities.get("end_time"):
+            self._schedule_update()
+        # Progress, name and countdown changes never cause pushes.
 
     @callback
     def _schedule_stop(self) -> None:
@@ -244,7 +285,9 @@ class PrintLiveActivity:
 
     @callback
     def _start_new_activity(self, *, force: bool = False) -> None:
-        if self._active or (self._start_task and not self._start_task.done()):
+        if self._stopped or self._active or (self._start_task and not self._start_task.done()):
+            return
+        if not force and self._retry_unsub is not None:
             return
         self._generation += 1
         gen = self._generation
@@ -267,57 +310,51 @@ class PrintLiveActivity:
                 return
             if self._progress() >= 100:
                 # Ignore stale 100% from the preceding completed print.
-                self._retry_start_later()
+                self._retry_start_later(delay=30)
                 return
             self._title = self.get_name() or "A1 mini"
             if not force and self._last_start_at is not None:
-                wait = MIN_START_INTERVAL - (asyncio.get_running_loop().time() - self._last_start_at)
+                wait = MIN_START_INTERVAL - (dt_util.now().timestamp() - self._last_start_at)
                 if wait > 0:
                     self._log(f"start delayed {wait:.0f}s (rate limit)")
                     await asyncio.sleep(wait)
                     if gen != self._generation or self._state("print_status") not in ACTIVE_STATES:
                         return
-            await self._async_push(starting=True, force=True)
+            await self._async_push(starting=True)
         except asyncio.CancelledError:
             raise
         except Exception:
             _LOGGER.exception("Could not start Bambu Live Activity")
 
+    def _eta_has_drifted(self) -> bool:
+        eta = self._valid_end_timestamp()
+        threshold = self.options.get("eta_drift_minutes", 3) * 60
+        return eta is not None and (self._last_eta is None or abs(eta - self._last_eta) >= threshold)
+
     @callback
-    def _schedule_update(self, *, urgent: bool = False) -> None:
-        if not self._active or self._state("print_status") not in ACTIVE_STATES:
+    def _schedule_update(self) -> None:
+        if self._stopped or not self._active or self._state("print_status") not in ACTIVE_STATES:
             return
-        # Never reset an already-scheduled update on each incoming MQTT event.
+        if not self._eta_has_drifted():
+            self._cancel_timer("_update_unsub")
+            return
         if self._update_unsub is not None:
             return
-        now = asyncio.get_running_loop().time()
-        remaining_gap = max(0.0, MIN_UPDATE_INTERVAL - (now - self._last_push_at))
-        delay = 0.5 if urgent else max(COALESCE_SECONDS, remaining_gap)
+        gap = MIN_UPDATE_INTERVAL - (dt_util.now().timestamp() - max(self._last_push_at, self._last_attempt_at))
 
         @callback
         def send(_: datetime) -> None:
             self._update_unsub = None
-            if self._active and self._state("print_status") in ACTIVE_STATES:
-                self.hass.async_create_task(self._async_push())
+            self.hass.async_create_task(self._async_push())
 
-        self._update_unsub = async_call_later(self.hass, delay, send)
-
-    @callback
-    def _schedule_heartbeat(self) -> None:
-        self._cancel_timer("_heartbeat_unsub")
-
-        @callback
-        def tick(_: datetime) -> None:
-            self._heartbeat_unsub = None
-            if self._active and self._state("print_status") in ACTIVE_STATES:
-                self.hass.async_create_task(self._async_push(force=True))
-
-        self._heartbeat_unsub = async_call_later(self.hass, HEARTBEAT_SECONDS, tick)
+        self._update_unsub = async_call_later(self.hass, max(COALESCE_SECONDS if gap <= 0 else 0, gap), send)
 
     @callback
     def _schedule_rollover(self) -> None:
+        if self._stopped:
+            return
         self._cancel_timer("_rollover_unsub")
-        self._next_rollover_at = asyncio.get_running_loop().time() + LONG_PRINT_ROLLOVER_SECONDS
+        self._next_rollover_at = self._started_at + LONG_PRINT_ROLLOVER_SECONDS
 
         @callback
         def tick(_: datetime) -> None:
@@ -326,11 +363,13 @@ class PrintLiveActivity:
                 self.hass.async_create_task(self._async_rollover())
 
         self._rollover_unsub = async_call_later(
-            self.hass, LONG_PRINT_ROLLOVER_SECONDS, tick
+            self.hass, max(0, self._next_rollover_at - dt_util.now().timestamp()), tick
         )
 
     @callback
-    def _retry_start_later(self) -> None:
+    def _retry_start_later(self, *, delay: float = MIN_UPDATE_INTERVAL) -> None:
+        if self._stopped:
+            return
         self._cancel_timer("_retry_unsub")
 
         @callback
@@ -339,22 +378,40 @@ class PrintLiveActivity:
             if not self._active and self._state("print_status") in ACTIVE_STATES:
                 self._start_new_activity()
 
-        self._retry_unsub = async_call_later(self.hass, 30, retry)
+        self._retry_unsub = async_call_later(self.hass, delay, retry)
 
     async def _async_rollover(self) -> None:
         """Apple expires an activity after eight hours; renew only then."""
-        if self._state("print_status") not in ACTIVE_STATES:
+        if self._stopped or self._state("print_status") not in ACTIVE_STATES:
             return
         await self._async_clear()
+        if self._stopped:
+            return
+        if self._active:
+            @callback
+            def retry(_: datetime) -> None:
+                self._rollover_unsub = None
+                self.hass.async_create_task(self._async_rollover())
+
+            self._rollover_unsub = async_call_later(self.hass, MIN_UPDATE_INTERVAL, retry)
+            return
         if self._state("print_status") in ACTIVE_STATES:
             self._start_new_activity(force=True)  # planned renewal, not a flap
 
-    async def _async_push(self, *, starting: bool = False, force: bool = False) -> None:
+    async def _async_push(self, *, starting: bool = False) -> None:
         async with self._push_lock:
-            if self._state("print_status") not in ACTIVE_STATES:
+            if self._stopped or self._state("print_status") not in ACTIVE_STATES:
                 return
             if not starting and not self._active:
                 return  # queued update from before a clear; would reopen a closed activity
+            now = dt_util.now().timestamp()
+            if not starting:
+                # Recheck inside the lock: queued tasks must not bypass either gate.
+                if not self._eta_has_drifted():
+                    return
+                if now - max(self._last_push_at, self._last_attempt_at) < MIN_UPDATE_INTERVAL:
+                    self._schedule_update()
+                    return
             progress = self._progress()
             end_timestamp = self._valid_end_timestamp()
             remaining = self._remaining_minutes(end_timestamp)
@@ -368,41 +425,38 @@ class PrintLiveActivity:
                 else f"{remaining}m" if remaining is not None else "--"
             )
             title = self._title or self.get_name() or "A1 mini"
-            data_key = (progress, rem_text, finish_text, self._state("print_status"))
-            if not force and self._last_payload == data_key:
-                return
 
             payload = build_payload(
                 self.tag, title, self._state("print_status"), progress, rem_text, finish_text, starting
             )
+            payload["data"]["url"] = dashboard_path(self.serial)
+            self._last_attempt_at = now
             if starting:
                 self._maybe_open = True
-                self._last_start_at = asyncio.get_running_loop().time()
+                self._last_start_at = self._started_at = now
                 self.starts += 1
+                self._print_seen = True
+            # Persist before sending too: a crash during notify must not restart.
+            await self._async_save()
             try:
                 await self.notify(payload)
             except Exception:
                 _LOGGER.exception("Failed to update Bambu Live Activity")
                 self._log(f"{'start' if starting else 'update'} FAILED")
                 if starting:
-                    self._maybe_open = False
-                if self._state("print_status") in ACTIVE_STATES:
-                    if starting:
-                        self._retry_start_later()
-                    else:
-                        # Keep retrying on the once-a-minute heartbeat if
-                        # mobile notifications temporarily fail.
-                        self._schedule_heartbeat()
+                    self._retry_start_later()
+                else:
+                    self._schedule_update()
                 return
             self._log(f"{'START' if starting else 'update'} {progress}% {self._state('print_status')}")
             self._active = True
             self._title = title
-            self._last_payload = data_key
-            self._last_progress = progress
-            self._last_push_at = asyncio.get_running_loop().time()
-            self._schedule_heartbeat()
+            self._last_push_at = dt_util.now().timestamp()
+            self._last_eta = end_timestamp
+            await self._async_save()
             if starting:
                 self._schedule_rollover()
+            self._schedule_update()
 
     async def async_demo(self) -> None:
         """Play a short fake print on its own tag so users can preview the look."""
@@ -429,24 +483,36 @@ class PrintLiveActivity:
         if task is not None and task is not asyncio.current_task() and not task.done():
             task.cancel()
         self._start_task = None
-        for attr in ("_update_unsub", "_heartbeat_unsub", "_rollover_unsub", "_retry_unsub", "_stop_unsub"):
+        for attr in ("_update_unsub", "_rollover_unsub", "_retry_unsub", "_stop_unsub"):
             self._cancel_timer(attr)
 
     async def _async_clear(self) -> None:
         self._cancel_work()
         async with self._push_lock:
+            if self._stopped:
+                return
             if self._active or self._maybe_open:
                 try:
                     await self.notify({"message": "clear_notification", "data": {"tag": self.tag}})
                     self._log("clear")
                 except Exception:
                     _LOGGER.warning("Unable to clear Bambu Live Activity", exc_info=True)
+
+                    @callback
+                    def retry_clear(_: datetime) -> None:
+                        self._retry_unsub = None
+                        if self._state("print_status") not in ACTIVE_STATES:
+                            self.hass.async_create_task(self._async_clear())
+
+                    # Don't clear a subsequent running print on a delayed retry.
+                    self._retry_unsub = async_call_later(
+                        self.hass, MIN_UPDATE_INTERVAL, retry_clear,
+                    )
+                    return
             self._active = False
             self._maybe_open = False
             self._title = None
-            self._last_payload = None
-            self._last_progress = None
-            self._last_push_at = 0.0
+            await self._async_save()
 
     @callback
     def _cancel_timer(self, attr: str) -> None:
@@ -463,7 +529,7 @@ class PrintLiveActivity:
     def _progress(self) -> int:
         try:
             return max(0, min(100, int(float(self._state("print_progress")))))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return 0
 
     def _valid_end_timestamp(self) -> float | None:
@@ -491,11 +557,11 @@ class PrintLiveActivity:
             return None
         try:
             remaining = float(state.state)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
         unit = str(state.attributes.get("unit_of_measurement", "min")).lower()
         if unit in ("h", "hour", "hours"):
             remaining *= 60
         elif unit in ("s", "sec", "seconds"):
             remaining /= 60
-        return max(0, math.ceil(remaining)) if remaining > 0 else None
+        return max(0, math.ceil(remaining)) if math.isfinite(remaining) and remaining > 0 else None

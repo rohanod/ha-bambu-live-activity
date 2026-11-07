@@ -75,5 +75,16 @@
         }
       }
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Live Activity updates",
+        "description": "Updates require both 10 minutes since the last successful push and this much drift in the absolute estimated completion time. Progress and countdown changes never trigger updates.",
+        "data": {
+          "eta_drift_minutes": "ETA drift threshold (minutes)"
+        }
+      }
+    }
   }
 }

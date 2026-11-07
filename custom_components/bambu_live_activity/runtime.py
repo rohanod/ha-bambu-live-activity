@@ -43,6 +43,7 @@ class BambuPrintNotificationsRuntime:
             self.serial,
             self._human_model_name,
             self._async_mobile_notify,
+            dict(entry.options),
         )
 
     async def async_start(self) -> None:

@@ -1,57 +1,77 @@
 # Bambu Live Activity
 
-HACS-compatible Home Assistant custom integration that adds a quiet Live Activity for Bambu Lab printers **without automations, scripts, helpers, or extra entities**. It builds on the v0.1.5 dedicated print-finished notifications; existing config entries remain valid.
+Home Assistant integration for one quiet Bambu Lab print Live Activity, completion notifications, and a matching hidden dashboard. Version 0.2.0 replaces percentage-triggered pushes and the one-minute heartbeat with ETA-drift updates.
 
-## Requirements
+## Install and update with HA Marketplace
 
-- Home Assistant 2026.7 or newer, the Home Assistant iOS Companion App, and its Live Activities permission
-- [ha-bambulab](https://github.com/greghesp/ha-bambulab) configured for the printer
-- A working `notify.mobile_app_*` action configured in this integration
+On Home Assistant **2026.11+**, open **Settings → Marketplace → Add from link**, enter `https://github.com/rohanod/ha-bambu-live-activity`, and install **Bambu Live Activity**. Restart Home Assistant, then add the integration under **Settings → Devices & services** if it is not already configured.
 
-## Live Activity layout
+Existing HACS installations migrate automatically through Home Assistant's Marketplace migration. Keep the existing integration entry: the domain, printer identity, notification target, and Live Activity tag stay unchanged. Do not add a second entry or recreate the old YAML package. The repository retains `hacs.json` because **Marketplace still requires it**; older HACS installations remain compatible.
 
-```text
-cone-customised                   9m
-47% · 16:26
-██████████░░░░
-```
+Sources: [Marketplace installation and HACS migration](https://www.home-assistant.io/integrations/marketplace/), [Companion Live Activities](https://companion.home-assistant.io/docs/notifications/live-activities).
 
-- **Apple Watch:** iOS 18+ mirrors the activity to the Watch Smart Stack automatically. Text is kept short (title, "16:26 finish", remaining time) so it stays readable there.
-- **Human-readable model name:** uses the actual Bambu task/filename (e.g. `cone-customised.gcode.3mf` → `cone-customised`), rejecting stale profile IDs and generic text such as `1 piece`.
-- **Progress and ETA:** a current percentage, estimated finish time, remaining-time text, and progress bar.
-- **Quiet updates:** same stable `tag`, `alert_once: true`, and `silent: true` on updates. One Live Activity is retained for the whole print; title changes do not restart it.
-- **Frequency:** when a full percentage point changes (with a 15-second minimum interval to avoid bursts), or after 60 seconds without another push. Additional MQTT fields are combined into one update.
-- **Remaining time:** derived from valid printer end time when possible; otherwise read from Bambu's remaining-time sensor with unit conversion (hours/minutes).
-- **Long prints:** renew once at about 7½ hours, before Apple's 8-hour activity limit.
-- **Completion:** a genuine `bambu_lab_event`/`event_print_finished` triggers one ordinary iPhone/Watch notification **and** one Home Assistant persistent notification. A stale `finish` state or a replayed finish event (e.g. after a reconnect or restart) never triggers an alert: only prints this integration saw running do.
+Requirements:
 
-*Important:* Home Assistant's Companion App says quiet updates use lower push priority and iOS may delay or throttle them outside Local Push. The initial Live Activity may still generate one alert; subsequent updates are silent. iOS also applies an independent push-to-start budget. This integration cannot bypass Apple's limits.
+- Home Assistant 2026.7+ (native Marketplace requires 2026.11+).
+- [ha-bambulab](https://github.com/greghesp/ha-bambulab), configured for the printer.
+- iOS Companion App with Live Activities enabled and a working `notify.mobile_app_*` action.
+
+## Update policy
+
+A routine push requires **both**:
+
+- At least **10 minutes** since the last successful notification action.
+- At least **3 minutes** of absolute ETA drift from the last published completion timestamp, in either direction.
+
+Change the drift threshold under the integration's **Configure** options. The 10-minute cooldown is fixed; it is **not** an update schedule. A stable ETA produces no further push, even for an hour. Percentage, temperature, layers, model-name changes and the decreasing remaining-time countdown do not trigger pushes. No heartbeat or keep-alive is required.
+
+One deferred timer rechecks the *current* ETA when the cooldown expires. Further changes do not queue pushes. A recovered or unavailable ETA discards the pending update. If a print began without a usable ETA, the first valid ETA may be published after the cooldown.
+
+Starts, ends, and planned renewal before iOS's eight-hour limit are lifecycle operations, outside the routine-update gate. Pause/resume preserves the same activity and does not independently send pushes; a later qualifying ETA update includes the current status. Confirmed finish/cancel/failure events end the activity immediately. A status-only stop has a 30-second debounce to tolerate transient `idle`/`finish` flaps. Existing print-finished phone/Watch and HA persistent notifications remain intact.
+
+Notification failures retain the last successful baseline and back off for 10 minutes. Home Assistant's notification action does **not** acknowledge delivery or rendering on the iPhone: the persisted success means the action returned successfully, not that APNs/iOS displayed it. Apple may throttle or drop updates independently.
+
+## Persistence and dashboard
+
+The integration owns these resources; no manual helpers, automations, scripts, Lovelace resources, HACS cards, or kiosk-mode setup are needed:
+
+- Two diagnostic timestamp sensors: **Last successful Live Activity update** and **Last published print ETA**. They expose publication state saved atomically through Home Assistant's storage API, including across restarts. They remain available after a print ends.
+- One **Live Activity model** sensor, using the same model-name resolver as the push and updating directly from printer events.
+- One hidden dashboard panel per printer, at `/bambu-live-activity-<lowercase printer serial>/print`. It contains exactly **one** read-only card, with the same title, status colours, icon, percentage, finish time, remaining time, and progress bar. The layout adapts to iPhone widths. No navigation or printer controls are added.
+
+The panel reads current entity states and uses a local display clock. It does not depend on push frequency and makes no notification calls. The Live Activity itself remains the last published snapshot between qualifying updates.
+
+Every real start/update includes the Companion-supported **`data.url`** relative dashboard path. This routes supported Lock Screen and Dynamic Island taps into the originating server in the Companion App; it is not Android `clickAction`. Actual device taps depend on the installed Companion version and require an iPhone test.
+
+Restart/reload restores the open activity, cooldown, last published ETA, title, and renewal deadline without issuing another start. Unloading removes the integration's panel/listeners, without ending the phone activity. An ambiguous in-flight start is recovered conservatively using its existing tag.
+
+For an A1 mini with serial `0309DA480600983`, the dashboard path is `/bambu-live-activity-0309da480600983/print`.
 
 ## Debug actions
 
-Run these from **Developer tools → Actions** (or any script). All take an optional `entry_id` (printer); empty means every printer.
+Run in **Developer tools → Actions**. Optional `entry_id` selects one printer; omitted means all configured printers.
 
-| Action | Does |
+| Action | Purpose |
 |---|---|
-| `bambu_live_activity.test_activity` | Plays a ~25 s fake print on a separate tag. Uses iOS's push budget, so don't spam it. |
-| `bambu_live_activity.restart_activity` | Reopens the Live Activity for the running print right now (e.g. after you swiped it away). |
-| `bambu_live_activity.end_activity` | Ends the print and test Live Activities on the iPhone, even if the integration thinks none is open. |
-| `bambu_live_activity.test_finished_notification` | Sends a sample finished notification ("Test print", "Finished at HH:MM"). |
-| `bambu_live_activity.get_status` | Returns state, start count and the last 25 pushes. Check this if duplicates appear: more than one `START` per print means Home Assistant sent them. |
+| `bambu_live_activity.get_status` | Inspect state, publication timestamps, pending update, start count and last 25 pushes. Sends nothing. |
+| `bambu_live_activity.restart_activity` | Explicitly reopen a dismissed activity for a running print. |
+| `bambu_live_activity.end_activity` | Explicitly end real and test activities. |
+| `bambu_live_activity.test_activity` | Play a fake print on a separate `_test` tag. **Uses iOS push budget; do not automate.** |
+| `bambu_live_activity.test_finished_notification` | Send a sample finished alert. |
 
-The old *Test Live Activity* button entity is gone; delete its leftover unavailable entity in **Settings → Devices & services → Entities**.
+An unavailable, `restored: true` legacy automation/script/helper is not a running sender. Old `packages/a1mini-live-activity.yaml` installations must remain disabled to avoid competing senders. This integration does not remove legacy entities or modify other printer automations.
 
-## Duplicate protection
+## Verification and rollback
 
-- Every push for a printer uses one `tag`; an update never opens a new activity unless the previous one was ended.
-- Reloading or restarting Home Assistant does **not** end the activity; it keeps updating the same one.
-- A brief `idle`/`finish` status flap must last 30 s before the activity is ended, and fresh starts are limited to one per 2 minutes per printer.
+```sh
+python3 -m py_compile custom_components/bambu_live_activity/*.py
+python3 -m unittest discover -s tests -v
+node --test tests/test_panel.mjs
+```
 
-## Install
+Tests use fake HA state, clock, storage, and notification actions: they send **no real pushes**. Browser checks can run against the bundled panel with simulated HA entity states. Full HA startup, physical printing, iOS delivery and actual Lock Screen/Dynamic Island taps require device verification; local tests cannot establish those results.
 
-HACS → Custom repositories → add this GitHub repository as **Integration** → install **Bambu Live Activity** → restart Home Assistant → **Settings → Devices & services → Add integration**.
-
-Existing Bambu Print Notifications (v0.1.5) users only need to update in HACS and restart. There is **no new setup**; the config-entry domain is unchanged. If you previously installed the old `packages/a1mini-live-activity.yaml` package, remove or disable it first to prevent duplicate pushes from two separate implementations.
+To roll back, select the previous release in Marketplace and restart HA. Existing config entries and saved publication state are retained; older releases ignore the new storage. Returning to 0.1.9 also restores its frequent update policy and removes the bundled dashboard. Diagnostic entities from 0.2.0 may appear unavailable on the older version. Do not run both senders or manually clear/restart an activity during migration.
 
 ## Licence
 

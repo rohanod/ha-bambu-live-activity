@@ -28,7 +28,7 @@ jobs:
       - uses: home-assistant/actions/hassfest@master
 
   unit-tests:
-    name: Model name regressions
+    name: Sender and model regressions
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,3 +36,13 @@ jobs:
         with:
           python-version: "3.13"
       - run: python -m unittest discover -s tests -v
+
+  frontend-tests:
+    name: Dashboard regressions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: node --test tests/test_panel.mjs
