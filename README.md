@@ -1,6 +1,6 @@
 # Bambu Live Activity
 
-Home Assistant integration for one quiet Bambu Lab print Live Activity, completion notifications, and a matching hidden dashboard. Version 0.2.0 replaces percentage-triggered pushes and the one-minute heartbeat with ETA-drift updates.
+Home Assistant integration for one quiet Bambu Lab print Live Activity, completion notifications, and a matching hidden dashboard. Version 0.2.1 replaces percentage-triggered pushes and the one-minute heartbeat with ETA-drift updates.
 
 ## Install and update with HA Marketplace
 
