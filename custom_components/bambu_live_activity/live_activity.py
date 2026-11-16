@@ -6,7 +6,6 @@ import asyncio
 from collections import deque
 from datetime import datetime
 import logging
-import math
 from typing import Any, Awaitable, Callable
 
 from homeassistant.core import Event, HomeAssistant, callback
@@ -55,11 +54,12 @@ STYLES = {
 
 
 def build_payload(
-    tag: str, title: str, status: str, progress: int, rem_text: str, finish_text: str, starting: bool
+    tag: str, title: str, status: str, progress: int, starting: bool,
+    end_timestamp: float | None = None,
 ) -> dict[str, Any]:
     accent, card, word = STYLES.get(status, STYLES["running"])
     if status == "running":
-        message = f"{finish_text} finish"  # short: Watch Smart Stack truncates long lines
+        message = "Printing" if end_timestamp is not None else "ETA unavailable"
     elif status == "pause":
         message = f"{word} at {progress}%"
     else:
@@ -69,8 +69,8 @@ def build_payload(
         "live_update": True,
         "progress": progress,
         "progress_max": 100,
-        # Compact view (Dynamic Island, Watch): keep it to one short token.
-        "critical_text": "Paused" if status == "pause" else "Prep" if status in ("prepare", "slicing") else rem_text,
+        "critical_text": "Paused" if status == "pause" else "Prep" if status in ("prepare", "slicing") else "--:--",
+        "chronometer": False,
         "alert_once": True,
         "notification_icon": "mdi:printer-pause" if status == "pause" else "mdi:printer-3d-nozzle",
         "notification_icon_color": accent,
@@ -78,6 +78,23 @@ def build_payload(
         "background_color": card,
         "text_color": "#F2F5F3",
     }
+    if status in {"running", "prepare", "slicing"} and end_timestamp is not None:
+        # An absolute deadline survives delayed delivery and ticks on the device.
+        data.update({
+            "chronometer": True,
+            "when": end_timestamp,
+            "when_relative": False,
+            "critical_text": dt_util.as_local(
+                datetime.fromtimestamp(end_timestamp, dt_util.UTC)
+            ).strftime("%H:%M"),
+        })
+        # Watch's compact view chooses percentage progress instead of its timer.
+        # Omit both fields so iOS/Watch show remaining time without more pushes.
+        data.pop("progress")
+        data.pop("progress_max")
+    elif status == "running":
+        data.pop("progress")
+        data.pop("progress_max")
     # Updates are quiet; the initial push may alert once.
     if not starting:
         data["silent"] = True
@@ -414,20 +431,10 @@ class PrintLiveActivity:
                     return
             progress = self._progress()
             end_timestamp = self._valid_end_timestamp()
-            remaining = self._remaining_minutes(end_timestamp)
-            finish_text = (
-                dt_util.as_local(datetime.fromtimestamp(end_timestamp, dt_util.UTC)).strftime("%H:%M")
-                if end_timestamp is not None else "--:--"
-            )
-            rem_text = (
-                f"{remaining // 60}h {remaining % 60:02d}m"
-                if remaining is not None and remaining >= 60
-                else f"{remaining}m" if remaining is not None else "--"
-            )
             title = self._title or self.get_name() or "A1 mini"
 
             payload = build_payload(
-                self.tag, title, self._state("print_status"), progress, rem_text, finish_text, starting
+                self.tag, title, self._state("print_status"), progress, starting, end_timestamp
             )
             payload["data"]["url"] = dashboard_path(self.serial)
             self._last_attempt_at = now
@@ -468,11 +475,11 @@ class PrintLiveActivity:
     async def _play_demo(self) -> None:
         tag = f"{self.tag}_test"
         self._log("test activity")
-        steps = [("prepare", 0, "12m"), ("running", 20, "10m"), ("running", 55, "5m"),
-                 ("pause", 55, "5m"), ("running", 80, "2m"), ("running", 100, "1m")]
-        finish = dt_util.now().strftime("%H:%M")
+        steps = [("prepare", 0, 12), ("running", 20, 10), ("running", 55, 5),
+                 ("pause", 55, 5), ("running", 80, 2), ("running", 100, 1)]
         for i, (status, progress, rem) in enumerate(steps):
-            await self.notify(build_payload(tag, "Test print", status, progress, rem, finish, i == 0))
+            end = dt_util.now().timestamp() + rem * 60
+            await self.notify(build_payload(tag, "Test print", status, progress, i == 0, end))
             await asyncio.sleep(4)
         await self.notify({"message": "clear_notification", "data": {"tag": tag}})
 
@@ -547,21 +554,3 @@ class PrintLiveActivity:
         # Ignore the previous print's expired ETA and absurd dates.
         diff = timestamp - dt_util.now().timestamp()
         return timestamp if 0 < diff < 14 * 24 * 3600 else None
-
-    def _remaining_minutes(self, end_timestamp: float | None) -> int | None:
-        if end_timestamp is not None:
-            return max(1, math.ceil((end_timestamp - dt_util.now().timestamp()) / 60))
-        entity_id = self.entities.get("remaining_time")
-        state = self.hass.states.get(entity_id) if entity_id else None
-        if state is None:
-            return None
-        try:
-            remaining = float(state.state)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        unit = str(state.attributes.get("unit_of_measurement", "min")).lower()
-        if unit in ("h", "hour", "hours"):
-            remaining *= 60
-        elif unit in ("s", "sec", "seconds"):
-            remaining /= 60
-        return max(0, math.ceil(remaining)) if math.isfinite(remaining) and remaining > 0 else None

@@ -131,6 +131,52 @@ class TestActivity(unittest.IsolatedAsyncioTestCase):
         await self.la._async_push()
         self.assertEqual(len(self.pushes), 1)
 
+    async def test_running_uses_absolute_native_countdown_without_progress(self):
+        await self.start()
+        data = self.pushes[0]["data"]
+        self.assertTrue(data.get("chronometer"))
+        self.assertEqual(data.get("when"), self.clock + 7200)
+        self.assertIs(data.get("when_relative"), False)
+        self.assertNotIn("progress", data)
+        self.assertNotIn("progress_max", data)
+        finish = datetime.fromtimestamp(self.clock + 7200, timezone.utc).strftime("%H:%M")
+        self.assertEqual(data["critical_text"], finish)
+        await self.advance(3600)
+        self.assertEqual(len(self.pushes), 1)
+        self.assertEqual(data["when"] - self.clock, 3600)
+
+    async def test_drift_update_retargets_native_countdown(self):
+        await self.start()
+        self.eta(300)
+        await self.advance(600)
+        data = self.pushes[-1]["data"]
+        self.assertTrue(data.get("chronometer"))
+        self.assertEqual(data.get("when"), 1_800_000_000 + 7500)
+        self.assertTrue(data["silent"])
+
+    async def test_pause_and_unknown_eta_disable_native_countdown(self):
+        for status in ("pause", "prepare", "slicing", "running"):
+            with self.subTest(status=status):
+                self.states["print_status"] = status
+                self.states["end_time"] = "unavailable"
+                await self.la._async_push(starting=True)
+                data = self.pushes[-1]["data"]
+                self.assertIs(data.get("chronometer"), False)
+                self.assertNotIn("when", data)
+                if status == "running":
+                    self.assertEqual(self.pushes[-1]["message"], "ETA unavailable")
+
+    async def test_preparing_with_valid_eta_also_uses_local_timer(self):
+        self.states["print_status"] = "prepare"
+        await self.start()
+        self.assertTrue(self.pushes[-1]["data"].get("chronometer"))
+
+    async def test_published_pause_disables_existing_timer(self):
+        self.states["print_status"] = "pause"
+        await self.start()
+        self.assertIs(self.pushes[-1]["data"].get("chronometer"), False)
+        self.assertNotIn("when", self.pushes[-1]["data"])
+
     async def test_small_drift_no_update(self):
         await self.start()
         await self.advance(601)

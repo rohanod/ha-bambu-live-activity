@@ -1,6 +1,6 @@
 # Bambu Live Activity
 
-Home Assistant integration for one quiet Bambu Lab print Live Activity, completion notifications, and a matching hidden dashboard. Version 0.2.1 replaces percentage-triggered pushes and the one-minute heartbeat with ETA-drift updates.
+Home Assistant integration for one quiet Bambu Lab print Live Activity, completion notifications, and a matching hidden dashboard. Version 0.3.0 sends an absolute finish timestamp so iOS and the mirrored Watch Live Activity can count down locally, without minute-by-minute pushes.
 
 ## Install and update with HA Marketplace
 
@@ -39,7 +39,11 @@ The integration owns these resources; no manual helpers, automations, scripts, L
 - One **Live Activity model** sensor, using the same model-name resolver as the push and updating directly from printer events.
 - One hidden dashboard panel per printer, at `/bambu-live-activity-<lowercase printer serial>/print`. It contains exactly **one** read-only card, with the same title, status colours, icon, percentage, finish time, remaining time, and progress bar. The layout adapts to iPhone widths. No navigation or printer controls are added.
 
-The panel reads current entity states and uses a local display clock. It does not depend on push frequency and makes no notification calls. The Live Activity itself remains the last published snapshot between qualifying updates.
+The panel reads current entity states and uses a local display clock. It does not depend on push frequency and makes no notification calls. The Live Activity sends `chronometer: true`, `when: <absolute Unix finish timestamp>`, and `when_relative: false`. iOS renders remaining time locally, so delayed delivery does not restart the countdown and no minute updates are needed. Finish time appears in `critical_text`; the native timer occupies the main line/compact Dynamic Island. Percentage/progress fields are omitted for timed activities because the Watch compact presentation otherwise hides its countdown behind percentage progress. The dashboard continues to show live printer percentage and its progress bar.
+
+A valid ETA enables the timer during printing/preparation; a published pause disables it. Without a valid ETA the activity shows **ETA unavailable**, rather than a fixed remaining-time string. Pause/resume still follows the quiet update policy: the device only knows the last published state and ETA, so a running countdown can continue through a pause until a qualifying update arrives.
+
+Existing open activities gain the timer on their next qualifying update or planned renewal; installing/restarting alone does not bypass the drift gate or create another activity. New activities use it immediately when an ETA is available.
 
 Every real start/update includes the Companion-supported **`data.url`** relative dashboard path. This routes supported Lock Screen and Dynamic Island taps into the originating server in the Companion App; it is not Android `clickAction`. Actual device taps depend on the installed Companion version and require an iPhone test.
 
