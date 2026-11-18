@@ -119,6 +119,8 @@ class PrintLiveActivity:
         self.options = options or {}
         self._store = Store(hass, 1, f"bambu_live_activity.{serial}")
         self._last_eta: float | None = None
+        self._last_status: str | None = None
+        self._retry_after = 0.0
         self._started_at = 0.0
         self._last_attempt_at = 0.0
         self.entities = resolve_progress_entities(hass, serial)
@@ -126,6 +128,7 @@ class PrintLiveActivity:
         self.tag = f"bambu_print_{''.join(c for c in serial if c.isalnum())[-16:]}"
         self._unsub: Any | None = None
         self._update_unsub: Any | None = None
+        self._update_task: asyncio.Task | None = None
         self._rollover_unsub: Any | None = None
         self._start_task: asyncio.Task | None = None
         self._push_lock = asyncio.Lock()
@@ -162,6 +165,8 @@ class PrintLiveActivity:
         self._title = saved.get("title")
         self._last_push_at = saved.get("last_push_at", 0.0)
         self._last_eta = saved.get("last_eta")
+        self._last_status = saved.get("last_status")
+        self._retry_after = saved.get("retry_after", 0.0)
         self._started_at = saved.get("started_at", 0.0)
         self._last_attempt_at = saved.get("last_attempt_at", 0.0)
         self._last_start_at = saved.get("last_start_at")
@@ -187,6 +192,8 @@ class PrintLiveActivity:
             "title": self._title,
             "last_push_at": self._last_push_at,
             "last_eta": self._last_eta,
+            "last_status": self._last_status,
+            "retry_after": self._retry_after,
             "started_at": self._started_at,
             "last_attempt_at": self._last_attempt_at,
             "last_start_at": self._last_start_at,
@@ -253,6 +260,7 @@ class PrintLiveActivity:
             "seconds_since_last_push": round(loop_now - self._last_push_at) if self._last_push_at else None,
             "seconds_since_last_start": round(loop_now - self._last_start_at) if self._last_start_at else None,
             "last_published_eta": self._last_eta,
+            "last_published_status": self._last_status,
             "last_successful_update": self._last_push_at or None,
             "drift_threshold_seconds": self.options.get("eta_drift_minutes", 3) * 60,
             "update_pending": self._update_unsub is not None,
@@ -348,16 +356,32 @@ class PrintLiveActivity:
         threshold = self.options.get("eta_drift_minutes", 3) * 60
         return eta is not None and (self._last_eta is None or abs(eta - self._last_eta) >= threshold)
 
+    def _needs_immediate_update(self) -> bool:
+        # Compare with successful publication, not repeated MQTT state events.
+        return self._state("print_status") != self._last_status or (
+            self._last_eta is None and self._valid_end_timestamp() is not None
+        )
+
     @callback
     def _schedule_update(self) -> None:
         if self._stopped or not self._active or self._state("print_status") not in ACTIVE_STATES:
             return
-        if not self._eta_has_drifted():
+        immediate = self._needs_immediate_update()
+        if not immediate and not self._eta_has_drifted():
             self._cancel_timer("_update_unsub")
+            return
+        now = dt_util.now().timestamp()
+        if immediate and now >= self._retry_after:
+            self._cancel_timer("_update_unsub")
+            if self._update_task is None or self._update_task.done() or self._update_task is asyncio.current_task():
+                self._update_task = self.hass.async_create_task(self._async_push())
             return
         if self._update_unsub is not None:
             return
-        gap = MIN_UPDATE_INTERVAL - (dt_util.now().timestamp() - max(self._last_push_at, self._last_attempt_at))
+        gap = self._retry_after - now if immediate else max(
+            self._retry_after - now,
+            MIN_UPDATE_INTERVAL - (now - max(self._last_push_at, self._last_attempt_at)),
+        )
 
         @callback
         def send(_: datetime) -> None:
@@ -423,18 +447,23 @@ class PrintLiveActivity:
                 return  # queued update from before a clear; would reopen a closed activity
             now = dt_util.now().timestamp()
             if not starting:
-                # Recheck inside the lock: queued tasks must not bypass either gate.
-                if not self._eta_has_drifted():
-                    return
-                if now - max(self._last_push_at, self._last_attempt_at) < MIN_UPDATE_INTERVAL:
+                # Recheck publication need/backoff under the lock to deduplicate tasks.
+                if now < self._retry_after:
                     self._schedule_update()
                     return
+                if not self._needs_immediate_update():
+                    if not self._eta_has_drifted():
+                        return
+                    if now - max(self._last_push_at, self._last_attempt_at) < MIN_UPDATE_INTERVAL:
+                        self._schedule_update()
+                        return
             progress = self._progress()
+            status = self._state("print_status")
             end_timestamp = self._valid_end_timestamp()
             title = self._title or self.get_name() or "A1 mini"
 
             payload = build_payload(
-                self.tag, title, self._state("print_status"), progress, starting, end_timestamp
+                self.tag, title, status, progress, starting, end_timestamp
             )
             payload["data"]["url"] = dashboard_path(self.serial)
             self._last_attempt_at = now
@@ -450,6 +479,8 @@ class PrintLiveActivity:
             except Exception:
                 _LOGGER.exception("Failed to update Bambu Live Activity")
                 self._log(f"{'start' if starting else 'update'} FAILED")
+                self._retry_after = dt_util.now().timestamp() + MIN_UPDATE_INTERVAL
+                await self._async_save()
                 if starting:
                     self._retry_start_later()
                 else:
@@ -460,6 +491,8 @@ class PrintLiveActivity:
             self._title = title
             self._last_push_at = dt_util.now().timestamp()
             self._last_eta = end_timestamp
+            self._last_status = status
+            self._retry_after = 0.0
             await self._async_save()
             if starting:
                 self._schedule_rollover()

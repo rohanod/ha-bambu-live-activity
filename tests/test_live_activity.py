@@ -115,9 +115,9 @@ class TestActivity(unittest.IsolatedAsyncioTestCase):
             if not timer.cancelled and timer.at <= self.clock:
                 timer.cancelled = True
                 timer.callback(self.now())
-        if self.tasks:
-            await asyncio.gather(*self.tasks)
-            self.tasks.clear()
+        while self.tasks:
+            tasks, self.tasks = self.tasks, []
+            await asyncio.gather(*tasks)
 
     def eta(self, drift):
         self.states["end_time"] = datetime.fromtimestamp(1_800_000_000 + 7200 + drift, timezone.utc).isoformat()
@@ -221,14 +221,113 @@ class TestActivity(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.pushes), 2)
         self.assertEqual(self.la.starts, 0)
 
-    async def test_pause_resume_no_push_or_clear(self):
+    async def test_pause_resume_update_immediately_without_clear_or_restart(self):
         await self.start()
-        for status in ("pause", "running", "pause", "running"):
+        for status in ("pause", "running"):
             self.states["print_status"] = status
             self.la._on_change(SimpleNamespace(data={"entity_id": "print_status", "new_state": self.get_state("print_status")}))
-        await self.advance(601)
-        self.assertEqual(len(self.pushes), 1)
+            await self.advance(0)
+            self.assertEqual(self.pushes[-1]["data"]["chronometer"], status == "running")
+        self.assertEqual(len(self.pushes), 3)
+        self.assertEqual(self.la.starts, 1)
+        self.assertFalse(any(p["message"] == "clear_notification" for p in self.pushes))
         self.assertTrue(self.la._active)
+
+    async def test_prep_to_running_updates_immediately_with_unchanged_eta(self):
+        self.states["print_status"] = "prepare"
+        await self.start()
+        self.states["print_status"] = "running"
+        self.la._on_change(SimpleNamespace(data={"entity_id":"print_status", "new_state":self.get_state("print_status")}))
+        await self.advance(0)
+        self.assertEqual(len(self.pushes), 2)
+        self.assertEqual(self.pushes[-1]["message"], "Printing")
+        self.assertEqual(self.la.starts, 1)
+        self.assertEqual(self.pushes[-1]["data"]["tag"], self.pushes[0]["data"]["tag"])
+
+    async def test_first_valid_eta_updates_immediately(self):
+        self.states["end_time"] = "unavailable"
+        await self.start()
+        self.eta(0)
+        await self.advance(0)
+        self.assertEqual(len(self.pushes), 2)
+        self.assertTrue(self.pushes[-1]["data"]["chronometer"])
+        self.eta(60)
+        await self.advance(0)
+        self.assertEqual(len(self.pushes), 2)
+
+    async def test_same_status_events_do_not_push(self):
+        await self.start()
+        for _ in range(20):
+            self.la._on_change(SimpleNamespace(data={"entity_id":"print_status", "new_state":self.get_state("print_status")}))
+        await self.advance(0)
+        self.assertEqual(len(self.pushes), 1)
+
+    async def test_state_change_failure_retries_with_backoff(self):
+        await self.start()
+        attempts = []
+        async def fail(payload):
+            attempts.append(payload)
+            raise RuntimeError("offline")
+        self.la.notify = fail
+        self.states["print_status"] = "pause"
+        self.la._on_change(SimpleNamespace(data={"entity_id":"print_status", "new_state":self.get_state("print_status")}))
+        with self.assertLogs(activity.__name__, level="ERROR"):
+            await self.advance(0)
+        for _ in range(20):
+            self.la._on_change(SimpleNamespace(data={"entity_id":"print_status", "new_state":self.get_state("print_status")}))
+        await self.advance(599)
+        self.assertEqual(len(attempts), 1)
+        self.la.notify = self.notify
+        await self.advance(1)
+        self.assertEqual(len(self.pushes), 2)
+        self.assertEqual(self.pushes[-1]["data"]["critical_text"], "Paused")
+
+    async def test_state_failure_backoff_survives_restart(self):
+        await self.start()
+        async def fail(payload):
+            raise RuntimeError("offline")
+        self.la.notify = fail
+        self.states["print_status"] = "pause"
+        with self.assertLogs(activity.__name__, level="ERROR"):
+            await self.la._async_push()
+        await self.la.async_stop()
+        self.la = self.make_activity()
+        await self.la.async_start()
+        await self.advance(599)
+        self.assertEqual(len(self.pushes), 1)
+        await self.advance(1)
+        self.assertEqual(len(self.pushes), 2)
+        self.assertEqual(self.la.starts, 0)
+
+    async def test_upgrade_synchronizes_existing_activity_once(self):
+        await self.start()
+        self.store.data.pop("last_status")
+        await self.la.async_stop()
+        self.la = self.make_activity()
+        await self.la.async_start()
+        await self.advance(0)
+        self.assertEqual(len(self.pushes), 2)
+        self.assertEqual(self.la.starts, 0)
+        await self.la.async_stop()
+        self.la = self.make_activity()
+        await self.la.async_start()
+        await self.advance(0)
+        self.assertEqual(len(self.pushes), 2)
+
+    async def test_state_changed_during_notify_is_published_next(self):
+        await self.start()
+        async def resume_while_sending(payload):
+            self.pushes.append(payload)
+            if payload["data"]["critical_text"] == "Paused":
+                self.states["print_status"] = "running"
+                self.la._on_change(SimpleNamespace(data={"entity_id":"print_status", "new_state":self.get_state("print_status")}))
+        self.la.notify = resume_while_sending
+        self.states["print_status"] = "pause"
+        self.la._on_change(SimpleNamespace(data={"entity_id":"print_status", "new_state":self.get_state("print_status")}))
+        await self.advance(0)
+        self.assertEqual(len(self.pushes), 3)
+        self.assertEqual(self.la.snapshot()["last_published_status"], "running")
+        self.assertTrue(self.pushes[-1]["data"]["chronometer"])
 
     async def test_terminal_clear_serialized_once(self):
         await self.start()

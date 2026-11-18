@@ -80,7 +80,7 @@
     "step": {
       "init": {
         "title": "Live Activity updates",
-        "description": "Updates require both 10 minutes since the last successful push and this much drift in the absolute estimated completion time. Progress and countdown changes never trigger updates.",
+        "description": "Routine ETA-only updates require both 10 minutes since the last successful push and this much absolute ETA drift. State changes and the first valid ETA publish immediately. Progress/countdown changes never trigger updates.",
         "data": {
           "eta_drift_minutes": "ETA drift threshold (minutes)"
         }

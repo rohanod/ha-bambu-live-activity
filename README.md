@@ -18,16 +18,16 @@ Requirements:
 
 ## Update policy
 
-A routine push requires **both**:
+A routine **ETA-only** push requires **both**:
 
 - At least **10 minutes** since the last successful notification action.
 - At least **3 minutes** of absolute ETA drift from the last published completion timestamp, in either direction.
 
 Change the drift threshold under the integration's **Configure** options. The 10-minute cooldown is fixed; it is **not** an update schedule. A stable ETA produces no further push, even for an hour. Percentage, temperature, layers, model-name changes and the decreasing remaining-time countdown do not trigger pushes. No heartbeat or keep-alive is required.
 
-One deferred timer rechecks the *current* ETA when the cooldown expires. Further changes do not queue pushes. A recovered or unavailable ETA discards the pending update. If a print began without a usable ETA, the first valid ETA may be published after the cooldown.
+One deferred timer rechecks the *current* ETA when the cooldown expires. Further changes do not queue pushes. A recovered or unavailable ETA discards the pending update. If a print began without a usable ETA, the **first valid ETA is published immediately**, without waiting for cooldown or drift.
 
-Starts, ends, and planned renewal before iOS's eight-hour limit are lifecycle operations, outside the routine-update gate. Pause/resume preserves the same activity and does not independently send pushes; a later qualifying ETA update includes the current status. Confirmed finish/cancel/failure events end the activity immediately. A status-only stop has a 30-second debounce to tolerate transient `idle`/`finish` flaps. Existing print-finished phone/Watch and HA persistent notifications remain intact.
+Starts, ends, and planned renewal before iOS's eight-hour limit are lifecycle operations, outside the routine-update gate. Preparation → printing and pause/resume changes update the **same activity immediately**, bypassing ETA drift and cooldown. Repeated reports of the same published state do not push again. Confirmed finish/cancel/failure events end the activity immediately. A status-only stop has a 30-second debounce to tolerate transient `idle`/`finish` flaps. Existing print-finished phone/Watch and HA persistent notifications remain intact.
 
 Notification failures retain the last successful baseline and back off for 10 minutes. Home Assistant's notification action does **not** acknowledge delivery or rendering on the iPhone: the persisted success means the action returned successfully, not that APNs/iOS displayed it. Apple may throttle or drop updates independently.
 
@@ -41,9 +41,9 @@ The integration owns these resources; no manual helpers, automations, scripts, L
 
 The panel reads current entity states and uses a local display clock. It does not depend on push frequency and makes no notification calls. The Live Activity sends `chronometer: true`, `when: <absolute Unix finish timestamp>`, and `when_relative: false`. iOS renders remaining time locally, so delayed delivery does not restart the countdown and no minute updates are needed. Finish time appears in `critical_text`; the native timer occupies the main line/compact Dynamic Island. Percentage/progress fields are omitted for timed activities because the Watch compact presentation otherwise hides its countdown behind percentage progress. The dashboard continues to show live printer percentage and its progress bar.
 
-A valid ETA enables the timer during printing/preparation; a published pause disables it. Without a valid ETA the activity shows **ETA unavailable**, rather than a fixed remaining-time string. Pause/resume still follows the quiet update policy: the device only knows the last published state and ETA, so a running countdown can continue through a pause until a qualifying update arrives.
+A valid ETA enables the timer during printing/preparation; a published pause disables it. Without a valid ETA the activity shows **ETA unavailable**, rather than a fixed remaining-time string. Pause/resume immediately publishes the new status, stopping or restoring the native countdown. Updates remain silent; iOS delivery/rendering can still be delayed by the system.
 
-Existing open activities gain the timer on their next qualifying update or planned renewal; installing/restarting alone does not bypass the drift gate or create another activity. New activities use it immediately when an ETA is available.
+The last successfully published status is persisted alongside ETA and cooldown. Restarting with unchanged status does not send another update or start. A changed status is synchronized immediately. Upgrading older publication records without a saved status sends one in-place synchronization, fixing an existing activity stuck on Prep without ending/restarting it. Failed sends retain their publication baseline and back off for 10 minutes, including across restarts. New activities use the timer immediately when an ETA is available.
 
 Every real start/update includes the Companion-supported **`data.url`** relative dashboard path. This routes supported Lock Screen and Dynamic Island taps into the originating server in the Companion App; it is not Android `clickAction`. Actual device taps depend on the installed Companion version and require an iPhone test.
 
