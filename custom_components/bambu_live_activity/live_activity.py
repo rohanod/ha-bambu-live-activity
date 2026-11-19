@@ -50,6 +50,9 @@ STYLES = {
     "pause": ("#FFB84D", "#1F1606", "Paused"),
     "prepare": ("#7FA8FF", "#0C1322", "Preparing"),
     "slicing": ("#7FA8FF", "#0C1322", "Preparing"),
+    "finish": ("#3DDC84", "#0B1A12", "Finished"),
+    "failed": ("#FF6B6B", "#220C0C", "Failed"),
+    "idle": ("#AEB8B2", "#141A16", "Stopped"),
 }
 
 
@@ -62,6 +65,8 @@ def build_payload(
         message = "Printing" if end_timestamp is not None else "ETA unavailable"
     elif status == "pause":
         message = f"{word} at {progress}%"
+    elif status in STOPPED_STATES:
+        message = word
     else:
         message = f"{word}…"
     data: dict[str, Any] = {
@@ -95,6 +100,8 @@ def build_payload(
     elif status == "running":
         data.pop("progress")
         data.pop("progress_max")
+    elif status in STOPPED_STATES:
+        data["critical_text"] = word
     # Updates are quiet; the initial push may alert once.
     if not starting:
         data["silent"] = True
@@ -184,6 +191,8 @@ class PrintLiveActivity:
             else:
                 self._start_new_activity()
         elif self._state("print_status") in STOPPED_STATES:
+            if self._active:
+                self._schedule_update()
             self._schedule_stop()
 
     async def _async_save(self) -> None:
@@ -286,6 +295,8 @@ class PrintLiveActivity:
                     self._schedule_update()
                 self._cancel_timer("_stop_unsub")
             elif status in STOPPED_STATES:
+                if self._active:
+                    self._schedule_update()
                 self._schedule_stop()
             return
 
@@ -352,6 +363,8 @@ class PrintLiveActivity:
             _LOGGER.exception("Could not start Bambu Live Activity")
 
     def _eta_has_drifted(self) -> bool:
+        if self._state("print_status") not in ACTIVE_STATES:
+            return False
         eta = self._valid_end_timestamp()
         threshold = self.options.get("eta_drift_minutes", 3) * 60
         return eta is not None and (self._last_eta is None or abs(eta - self._last_eta) >= threshold)
@@ -364,7 +377,7 @@ class PrintLiveActivity:
 
     @callback
     def _schedule_update(self) -> None:
-        if self._stopped or not self._active or self._state("print_status") not in ACTIVE_STATES:
+        if self._stopped or not self._active or self._state("print_status") not in ACTIVE_STATES | STOPPED_STATES:
             return
         immediate = self._needs_immediate_update()
         if not immediate and not self._eta_has_drifted():
@@ -441,7 +454,9 @@ class PrintLiveActivity:
 
     async def _async_push(self, *, starting: bool = False) -> None:
         async with self._push_lock:
-            if self._stopped or self._state("print_status") not in ACTIVE_STATES:
+            if self._stopped or self._state("print_status") not in ACTIVE_STATES | STOPPED_STATES:
+                return
+            if starting and self._state("print_status") not in ACTIVE_STATES:
                 return
             if not starting and not self._active:
                 return  # queued update from before a clear; would reopen a closed activity

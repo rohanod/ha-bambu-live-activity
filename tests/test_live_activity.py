@@ -436,6 +436,32 @@ class TestActivity(unittest.IsolatedAsyncioTestCase):
         await self.advance(30)
         self.assertEqual(self.pushes[-1]["message"], "clear_notification")
 
+    async def test_stopped_state_publishes_immediately_and_flap_resumes_in_place(self):
+        await self.start()
+        self.states["print_status"] = "idle"
+        self.la._on_change(SimpleNamespace(data={"entity_id":"print_status", "new_state":self.get_state("print_status")}))
+        await self.advance(0)
+        self.assertEqual(len(self.pushes), 2)
+        self.assertEqual(self.pushes[-1]["message"], "Stopped")
+        self.assertFalse(self.pushes[-1]["data"]["chronometer"])
+        self.assertTrue(self.la._active)
+        self.states["print_status"] = "running"
+        self.la._on_change(SimpleNamespace(data={"entity_id":"print_status", "new_state":self.get_state("print_status")}))
+        await self.advance(31)
+        self.assertEqual(len(self.pushes), 3)
+        self.assertEqual(self.la.starts, 1)
+        self.assertFalse(any(p["message"] == "clear_notification" for p in self.pushes))
+
+    async def test_terminal_state_labels_update_immediately(self):
+        for status, label in (("finish", "Finished"), ("failed", "Failed")):
+            self.states["print_status"] = "running"
+            await self.start()
+            self.states["print_status"] = status
+            self.la._on_change(SimpleNamespace(data={"entity_id":"print_status", "new_state":self.get_state("print_status")}))
+            await self.advance(0)
+            self.assertEqual(self.pushes[-1]["message"], label)
+            self.assertEqual(self.pushes[-1]["data"]["critical_text"], label)
+
     async def test_drift_while_notify_in_flight_is_rechecked(self):
         await self.start()
         self.eta(300)
