@@ -2,7 +2,8 @@
   "domain": "bambu_live_activity",
   "name": "Bambu Live Activity",
   "after_dependencies": [
-    "bambu_lab"
+    "bambu_lab",
+    "bambuddy"
   ],
   "codeowners": [
     "@rohanod"
@@ -18,5 +19,5 @@
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/rohanod/ha-bambu-live-activity/issues",
   "requirements": [],
-  "version": "0.3.1"
+  "version": "0.4.0"
 }

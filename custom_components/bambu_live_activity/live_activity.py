@@ -5,24 +5,26 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from datetime import datetime
+import math
 import logging
 from typing import Any, Awaitable, Callable
 
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.util import dt as dt_util
 
-from .const import BAMBU_DOMAIN, DOMAIN, dashboard_path
+from .const import DEFAULT_DRIFT_PERCENT, DOMAIN, IMMEDIATE_DRIFT_PERCENT, dashboard_path
+from .helpers import normalize_status
 
 _LOGGER = logging.getLogger(__name__)
 
 ACTIVE_STATES = {"prepare", "running", "pause", "slicing"}
 STOPPED_STATES = {"finish", "failed", "idle"}
 COALESCE_SECONDS = 2.0
+MINUTES_DISPLAY_VERSION = 1
 MIN_UPDATE_INTERVAL = 600.0
 NAME_WAIT_SECONDS = 30.0
 LONG_PRINT_ROLLOVER_SECONDS = 7.5 * 60 * 60
@@ -31,17 +33,6 @@ LONG_PRINT_ROLLOVER_SECONDS = 7.5 * 60 * 60
 STOP_DEBOUNCE_SECONDS = 30.0
 # Fresh start pushes are capped per printer; further requests wait it out.
 MIN_START_INTERVAL = 120.0
-
-
-def resolve_progress_entities(hass: HomeAssistant, serial: str) -> dict[str, str]:
-    """Follow ha-bambulab unique IDs instead of fragile user-renamable IDs."""
-    keys = {"print_status", "print_progress", "end_time", "remaining_time", "subtask_name"}
-    wanted = {f"{serial}_{key}": key for key in keys}
-    result: dict[str, str] = {}
-    for entry in er.async_get(hass).entities.values():
-        if entry.platform == BAMBU_DOMAIN and entry.unique_id in wanted:
-            result[wanted[entry.unique_id]] = entry.entity_id
-    return result
 
 
 # Per-state look: (accent for icon + bar, Lock Screen card, status word).
@@ -59,6 +50,8 @@ STYLES = {
 def build_payload(
     tag: str, title: str, status: str, progress: int, starting: bool,
     end_timestamp: float | None = None,
+    detail: str | None = None,
+    hms: bool = False,
 ) -> dict[str, Any]:
     accent, card, word = STYLES.get(status, STYLES["running"])
     if status == "running":
@@ -69,11 +62,11 @@ def build_payload(
         message = word
     else:
         message = f"{word}…"
+    if detail:
+        message = f"{message} · {detail}"
     data: dict[str, Any] = {
         "tag": tag,
         "live_update": True,
-        "progress": progress,
-        "progress_max": 100,
         "critical_text": "Paused" if status == "pause" else "Prep" if status in ("prepare", "slicing") else "--:--",
         "chronometer": False,
         "alert_once": True,
@@ -84,24 +77,16 @@ def build_payload(
         "text_color": "#F2F5F3",
     }
     if status in {"running", "prepare", "slicing"} and end_timestamp is not None:
-        # An absolute deadline survives delayed delivery and ticks on the device.
-        data.update({
-            "chronometer": True,
-            "when": end_timestamp,
-            "when_relative": False,
-            "critical_text": dt_util.as_local(
-                datetime.fromtimestamp(end_timestamp, dt_util.UTC)
-            ).strftime("%H:%M"),
-        })
-        # Watch's compact view chooses percentage progress instead of its timer.
-        # Omit both fields so iOS/Watch show remaining time without more pushes.
-        data.pop("progress")
-        data.pop("progress_max")
-    elif status == "running":
-        data.pop("progress")
-        data.pop("progress_max")
+        minutes = max(1, math.ceil((end_timestamp - dt_util.now().timestamp()) / 60))
+        hours, minutes = divmod(minutes, 60)
+        data["critical_text"] = f"{hours}h {minutes}m" if hours else f"{minutes}m"
     elif status in STOPPED_STATES:
         data["critical_text"] = word
+    if hms:
+        if status == "pause":
+            data["critical_text"] = "HMS"
+        data["notification_icon"] = "mdi:alert"
+        data["notification_icon_color"] = "#FFB84D"
     # Updates are quiet; the initial push may alert once.
     if not starting:
         data["silent"] = True
@@ -118,6 +103,9 @@ class PrintLiveActivity:
         get_name: Callable[[], str | None],
         notify: Callable[[dict[str, Any]], Awaitable[None]],
         options: dict[str, Any] | None = None,
+        *,
+        entities: dict[str, str] | None = None,
+        on_sensor_finish: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.hass = hass
         self.serial = serial
@@ -130,7 +118,9 @@ class PrintLiveActivity:
         self._retry_after = 0.0
         self._started_at = 0.0
         self._last_attempt_at = 0.0
-        self.entities = resolve_progress_entities(hass, serial)
+        self.entities = entities or {}
+        self.on_sensor_finish = on_sensor_finish
+        self._last_hms: tuple[str, ...] = ()
         # Same tag as 0.1.4, so it updates rather than multiplying activities.
         self.tag = f"bambu_print_{''.join(c for c in serial if c.isalnum())[-16:]}"
         self._unsub: Any | None = None
@@ -172,7 +162,9 @@ class PrintLiveActivity:
         self._title = saved.get("title")
         self._last_push_at = saved.get("last_push_at", 0.0)
         self._last_eta = saved.get("last_eta")
-        self._last_status = saved.get("last_status")
+        if saved.get("display_version") == MINUTES_DISPLAY_VERSION:
+            self._last_status = saved.get("last_status")
+        self._last_hms = tuple(saved.get("last_hms", ()))
         self._retry_after = saved.get("retry_after", 0.0)
         self._started_at = saved.get("started_at", 0.0)
         self._last_attempt_at = saved.get("last_attempt_at", 0.0)
@@ -202,6 +194,8 @@ class PrintLiveActivity:
             "last_push_at": self._last_push_at,
             "last_eta": self._last_eta,
             "last_status": self._last_status,
+            "display_version": MINUTES_DISPLAY_VERSION,
+            "last_hms": self._last_hms,
             "retry_after": self._retry_after,
             "started_at": self._started_at,
             "last_attempt_at": self._last_attempt_at,
@@ -271,7 +265,7 @@ class PrintLiveActivity:
             "last_published_eta": self._last_eta,
             "last_published_status": self._last_status,
             "last_successful_update": self._last_push_at or None,
-            "drift_threshold_seconds": self.options.get("eta_drift_minutes", 3) * 60,
+            "drift_threshold_percent": self.options.get("eta_drift_percent", DEFAULT_DRIFT_PERCENT),
             "update_pending": self._update_unsub is not None,
             "stop_pending": self._stop_unsub is not None,
             "entities": self.entities,
@@ -286,7 +280,7 @@ class PrintLiveActivity:
             return
 
         if entity_id == self.entities.get("print_status"):
-            status = str(new.state).lower()
+            status = normalize_status(str(new.state).lower())
             if status in ACTIVE_STATES:
                 self._print_seen = True
                 if not self._active and (self._start_task is None or self._start_task.done()):
@@ -302,7 +296,7 @@ class PrintLiveActivity:
 
         if not self._active or self._state("print_status") not in ACTIVE_STATES:
             return
-        if entity_id == self.entities.get("end_time"):
+        if entity_id in {self.entities.get("end_time"), self.entities.get("hms")}:
             self._schedule_update()
         # Progress, name and countdown changes never cause pushes.
 
@@ -315,7 +309,7 @@ class PrintLiveActivity:
         def tick(_: datetime) -> None:
             self._stop_unsub = None
             if self._state("print_status") in STOPPED_STATES:
-                self.hass.async_create_task(self._async_clear())
+                self.hass.async_create_task(self._async_sensor_stop())
 
         self._stop_unsub = async_call_later(self.hass, STOP_DEBOUNCE_SECONDS, tick)
 
@@ -362,17 +356,49 @@ class PrintLiveActivity:
         except Exception:
             _LOGGER.exception("Could not start Bambu Live Activity")
 
-    def _eta_has_drifted(self) -> bool:
+    async def _async_sensor_stop(self) -> None:
+        status = self._state("print_status")
+        if status not in STOPPED_STATES:
+            return
+        if status == "finish" and self.on_sensor_finish and self.consume_print_seen():
+            await self.on_sensor_finish()
+        else:
+            await self._async_clear()
+
+    def _eta_drift_percent(self) -> float:
         if self._state("print_status") not in ACTIVE_STATES:
-            return False
+            return 0
         eta = self._valid_end_timestamp()
-        threshold = self.options.get("eta_drift_minutes", 3) * 60
-        return eta is not None and (self._last_eta is None or abs(eta - self._last_eta) >= threshold)
+        if eta is None or self._last_eta is None:
+            return 0
+        # Compare both predictions at the same instant. A one-minute floor
+        # matches the printer's ETA resolution near the old finish time.
+        previous_remaining = max(60, self._last_eta - dt_util.now().timestamp())
+        return abs(eta - self._last_eta) * 100 / previous_remaining
+
+    def _eta_has_drifted(self) -> bool:
+        return self._eta_drift_percent() >= self.options.get("eta_drift_percent", DEFAULT_DRIFT_PERCENT)
+
+    def _hms_errors(self) -> dict[str, str] | None:
+        entity = self.entities.get("hms")
+        state = self.hass.states.get(entity) if entity else None
+        if state is None or state.state in {"unavailable", "unknown"}:
+            return None
+        return {
+            error["code"]: str(error.get("description") or error["code"])
+            for error in state.attributes.get("errors") or []
+            if isinstance(error, dict) and isinstance(error.get("code"), str) and error["code"]
+        }
 
     def _needs_immediate_update(self) -> bool:
         # Compare with successful publication, not repeated MQTT state events.
-        return self._state("print_status") != self._last_status or (
-            self._last_eta is None and self._valid_end_timestamp() is not None
+        status = self._state("print_status")
+        errors = self._hms_errors() if status in ACTIVE_STATES else None
+        return (
+            status != self._last_status
+            or (self._last_eta is None and self._valid_end_timestamp() is not None and status in ACTIVE_STATES)
+            or self._eta_drift_percent() > IMMEDIATE_DRIFT_PERCENT
+            or (errors is not None and tuple(sorted(errors)) != self._last_hms)
         )
 
     @callback
@@ -477,8 +503,16 @@ class PrintLiveActivity:
             end_timestamp = self._valid_end_timestamp()
             title = self._title or self.get_name() or "A1 mini"
 
+            errors = self._hms_errors() if status in ACTIVE_STATES else None
+            codes = tuple(sorted(errors)) if errors is not None else self._last_hms
+            new_errors = [code for code in codes if code not in self._last_hms] if errors else []
+            stage = self._state("stage")
+            detail = next(iter(errors.values())) if errors else (
+                stage.removeprefix("paused_").replace("_", " ").capitalize()
+                if status == "pause" and stage.startswith("paused_") else None
+            )
             payload = build_payload(
-                self.tag, title, status, progress, starting, end_timestamp
+                self.tag, title, status, progress, starting, end_timestamp, detail, bool(codes)
             )
             payload["data"]["url"] = dashboard_path(self.serial)
             self._last_attempt_at = now
@@ -507,11 +541,24 @@ class PrintLiveActivity:
             self._last_push_at = dt_util.now().timestamp()
             self._last_eta = end_timestamp
             self._last_status = status
+            self._last_hms = codes
             self._retry_after = 0.0
             await self._async_save()
+            if new_errors:
+                await self._async_notify_hms(errors, new_errors)
             if starting:
                 self._schedule_rollover()
             self._schedule_update()
+
+    async def _async_notify_hms(self, errors: dict[str, str], codes: list[str]) -> None:
+        try:
+            await self.notify({
+                "title": "Printer needs attention",
+                "message": "\n".join(f"{code}: {errors[code]}" for code in codes),
+                "data": {"tag": f"{self.tag}_hms", "url": dashboard_path(self.serial)},
+            })
+        except Exception:
+            _LOGGER.exception("Failed to send Bambuddy HMS notification")
 
     async def async_demo(self) -> None:
         """Play a short fake print on its own tag so users can preview the look."""
@@ -579,7 +626,8 @@ class PrintLiveActivity:
     def _state(self, key: str) -> str:
         entity_id = self.entities.get(key)
         obj = self.hass.states.get(entity_id) if entity_id else None
-        return str(obj.state).lower() if obj is not None else "unknown"
+        value = str(obj.state).lower() if obj is not None else "unknown"
+        return normalize_status(value) if key == "print_status" else value
 
     def _progress(self) -> int:
         try:

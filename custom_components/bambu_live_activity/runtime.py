@@ -11,8 +11,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 
-from .const import BAMBU_DOMAIN, CONF_NOTIFY_SERVICE, CONF_PRINTER_SERIAL
-from .helpers import resolve_print_status_entity
+from .const import BAMBU_DOMAIN, BAMBUDDY_DOMAIN, CONF_NOTIFY_SERVICE, CONF_PRINTER_SERIAL
 from .live_activity import PrintLiveActivity
 from .model_names import clean_title, title_from_job
 
@@ -22,18 +21,14 @@ FINISHED_COLOR = "#3DDC84"
 class BambuPrintNotificationsRuntime:
     """Send exactly one completion notification per real completed print."""
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, source: str, entities: dict[str, str]) -> None:
         self.hass = hass
         self.entry = entry
         self.serial: str = entry.data[CONF_PRINTER_SERIAL]
         self.notify_action: str = entry.data[CONF_NOTIFY_SERVICE]
 
-        status_entity = resolve_print_status_entity(hass, self.serial)
-        if status_entity is None:
-            raise HomeAssistantError("Bambu print status entity is unavailable")
-
-        registry = er.async_get(hass)
-        status_entry = registry.async_get(status_entity)
+        self.source = source
+        status_entry = er.async_get(hass).async_get(entities["print_status"])
         self.device_id = status_entry.device_id if status_entry is not None else None
         self.config_entry_id = status_entry.config_entry_id if status_entry is not None else None
         self._unsub = None
@@ -44,12 +39,15 @@ class BambuPrintNotificationsRuntime:
             self._human_model_name,
             self._async_mobile_notify,
             dict(entry.options),
+            entities=entities,
+            on_sensor_finish=self._async_notify_finished if source == BAMBUDDY_DOMAIN else None,
         )
 
     async def async_start(self) -> None:
-        self._unsub = self.hass.bus.async_listen(
-            f"{BAMBU_DOMAIN}_event", self._handle_bambu_event
-        )
+        if self.source == BAMBU_DOMAIN:
+            self._unsub = self.hass.bus.async_listen(
+                f"{BAMBU_DOMAIN}_event", self._handle_bambu_event
+            )
         await self.live_activity.async_start()
 
     async def async_stop(self) -> None:
@@ -134,7 +132,7 @@ class BambuPrintNotificationsRuntime:
         return self._human_model_name() or "A1 mini"
 
     def _bambu_print_job(self) -> Any | None:
-        if self.config_entry_id is None:
+        if self.source != BAMBU_DOMAIN or self.config_entry_id is None:
             return None
         coordinator = self.hass.data.get(BAMBU_DOMAIN, {}).get(self.config_entry_id)
         if coordinator is None:

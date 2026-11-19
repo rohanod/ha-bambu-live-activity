@@ -13,15 +13,17 @@ Sources: [Marketplace installation and HACS migration](https://www.home-assistan
 Requirements:
 
 - Home Assistant 2026.7+ (native Marketplace requires 2026.11+).
-- [ha-bambulab](https://github.com/greghesp/ha-bambulab), configured for the printer.
+- Either [Bambuddy](https://github.com/Spegeli/hacs_bambuddy) or [ha-bambulab](https://github.com/greghesp/ha-bambulab), configured for the printer.
 - iOS Companion App with Live Activities enabled and a working `notify.mobile_app_*` action.
+
+To switch an existing printer to Bambuddy, choose **Settings → Devices & services → Bambu Live Activity → Configure → Printer integration → Bambuddy**. The Bambuddy device must report the same hardware serial. This keeps your activity and dashboard identity. For a new setup, select both the source and its printer device.
 
 ## Update policy
 
 A routine **ETA-only** push requires **both**:
 
 - At least **10 minutes** since the last successful notification action.
-- At least **3 minutes** of absolute ETA drift from the last published completion timestamp, in either direction.
+- At least **3%** ETA drift by default. Divide the absolute ETA shift by the remaining time implied by the last published ETA, measured at the same instant. A shift **over 50%** bypasses the cooldown. For example, going from 1 hour remaining to over 1 hour 30 minutes triggers immediately.
 
 Change the drift threshold under the integration's **Configure** options. The 10-minute cooldown is fixed; it is **not** an update schedule. A stable ETA produces no further push, even for an hour. Percentage, temperature, layers, model-name changes and the decreasing remaining-time countdown do not trigger pushes. No heartbeat or keep-alive is required.
 
@@ -37,13 +39,13 @@ The integration owns these resources; no manual helpers, automations, scripts, L
 
 - Two diagnostic timestamp sensors: **Last successful Live Activity update** and **Last published print ETA**. They expose publication state saved atomically through Home Assistant's storage API, including across restarts. They remain available after a print ends.
 - One **Live Activity model** sensor, using the same model-name resolver as the push and updating directly from printer events.
-- One hidden dashboard panel per printer, at `/bambu-live-activity-<lowercase printer serial>/print`. It contains exactly **one** read-only card, with the same title, status colours, icon, percentage, finish time, remaining time, and progress bar. The layout adapts to iPhone widths. No navigation or printer controls are added.
+- One dashboard per printer at `/bambu-live-activity-<lowercase printer serial>/print`. It shows live progress, layers, temperatures, filament, AMS state, maintenance and HMS details when the source provides them. Supported controls include pause, resume, stop (with confirmation), speed and light. Each action uses the registered Home Assistant entity for the selected printer.
 
-The panel reads current entity states and uses a local display clock. It does not depend on push frequency and makes no notification calls. The Live Activity sends `chronometer: true`, `when: <absolute Unix finish timestamp>`, and `when_relative: false`. iOS renders remaining time locally, so delayed delivery does not restart the countdown and no minute updates are needed. Finish time appears in `critical_text`; the native timer occupies the main line/compact Dynamic Island. Percentage/progress fields are omitted for timed activities because the Watch compact presentation otherwise hides its countdown behind percentage progress. The dashboard continues to show live printer percentage and its progress bar.
+The Watch and iPhone Live Activities show the last published estimate as `1h 45m` or `9m`. Companion’s native countdown includes seconds, so this display stays at the last published value and updates on qualifying printer changes. Open the dashboard for current remaining minutes.
 
-A valid ETA enables the timer during printing/preparation; a published pause disables it. Without a valid ETA the activity shows **ETA unavailable**, rather than a fixed remaining-time string. Pause/resume immediately publishes the new status, stopping or restoring the native countdown. Updates remain silent; iOS delivery/rendering can still be delayed by the system.
+Bambuddy’s HMS warnings appear in the activity during a print, and newly reported codes send one notification with the printer’s troubleshooting description. Clearing a warning updates the activity. The dashboard always shows current warnings from Bambuddy. Paused prints can show a pause reason from the print stage.
 
-The last successfully published status is persisted alongside ETA and cooldown. Restarting with unchanged status does not send another update or start. A changed status is synchronized immediately. Upgrading older publication records without a saved status sends one in-place synchronization, fixing an existing activity stuck on Prep without ending/restarting it. Failed sends retain their publication baseline and back off for 10 minutes, including across restarts. New activities use the timer immediately when an ETA is available.
+The last successfully published status is persisted alongside ETA and cooldown. Restarting with unchanged status does not send another update or start. A changed status is synchronized immediately. Upgrading from an older display format sends one in-place update to show hours and minutes. Failed sends retain their publication baseline and back off for 10 minutes, including across restarts. New activities use the timer immediately when an ETA is available.
 
 Every real start/update includes the Companion-supported **`data.url`** relative dashboard path. This routes supported Lock Screen and Dynamic Island taps into the originating server in the Companion App; it is not Android `clickAction`. Actual device taps depend on the installed Companion version and require an iPhone test.
 

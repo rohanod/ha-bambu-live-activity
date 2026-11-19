@@ -7,17 +7,19 @@
         "description": "Track Bambu prints as a quiet Live Activity, and notify when a print finishes.",
         "data": {
           "printer_device": "Bambu printer",
-          "notify_service": "iPhone notification action"
+          "notify_service": "iPhone notification action",
+          "printer_source": "Printer integration"
         },
         "data_description": {
           "printer_device": "The Bambu printer to monitor.",
-          "notify_service": "Use the notify.mobile_app_* action for the target iPhone."
+          "notify_service": "Use the notify.mobile_app_* action for the target iPhone.",
+          "printer_source": "Match the integration of the selected printer device."
         }
       }
     },
     "error": {
-      "not_bambu_device": "The selected device does not have a Bambu Lab printer identifier.",
-      "missing_bambu_entities": "The Bambu Lab print status entity is unavailable.",
+      "not_bambu_device": "Select a printer device from the chosen integration.",
+      "missing_bambu_entities": "Enable the selected printer\u2019s status and progress sensors first.",
       "notify_action_unavailable": "That notify action is not currently available."
     },
     "abort": {
@@ -80,11 +82,15 @@
     "step": {
       "init": {
         "title": "Live Activity updates",
-        "description": "Routine ETA-only updates require both 10 minutes since the last successful push and this much absolute ETA drift. State changes and the first valid ETA publish immediately. Progress/countdown changes never trigger updates.",
+        "description": "Choose the source for this printer. ETA shifts above 50% of the previously estimated remaining time publish immediately. Smaller qualifying shifts use a 10-minute cooldown.",
         "data": {
-          "eta_drift_minutes": "ETA drift threshold (minutes)"
+          "printer_source": "Printer integration",
+          "eta_drift_percent": "Routine ETA drift threshold (%)"
         }
       }
+    },
+    "error": {
+      "missing_bambu_entities": "Enable the matching printer\u2019s status and progress sensors in this integration first."
     }
   }
 }

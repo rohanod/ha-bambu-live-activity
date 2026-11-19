@@ -16,6 +16,7 @@ def load_activity():
     modules = {}
     for name in ("homeassistant", "homeassistant.core", "homeassistant.exceptions",
                  "homeassistant.helpers", "homeassistant.helpers.entity_registry",
+                 "homeassistant.helpers.device_registry",
                  "homeassistant.helpers.event", "homeassistant.helpers.storage",
                  "homeassistant.helpers.dispatcher",
                  "homeassistant.util", "homeassistant.util.dt", "bambu_test"):
@@ -39,10 +40,35 @@ def load_activity():
         spec = importlib.util.spec_from_file_location("bambu_test.live_activity", ROOT / "live_activity.py")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        module.test_helpers = sys.modules["bambu_test.helpers"]
     return module
 
 
 activity = load_activity()
+
+
+class TestPrinterResolution(unittest.TestCase):
+    def test_bambuddy_resolution_uses_stable_ids_and_the_matching_device(self):
+        helpers = activity.test_helpers
+        prefix = "ENTRY_pSERIAL_"
+        def entity(domain, key, name, device="printer", disabled_by=None):
+            return SimpleNamespace(platform="bambuddy", domain=domain, device_id=device,
+                                   unique_id=prefix + key, entity_id=f"{domain}.{name}", disabled_by=disabled_by)
+        entries = [
+            entity("sensor", "status", "renamed_status"),
+            entity("sensor", "progress", "renamed_progress"),
+            entity("sensor", "hms_status", "renamed_hms"),
+            entity("button", "pause", "renamed_pause"),
+            entity("button", "stop", "disabled_stop", disabled_by="user"),
+            entity("light", "chamber_light", "another_device_light", device="other"),
+        ]
+        device = SimpleNamespace(id="printer", serial_number="SERIAL", identifiers={ ("bambuddy", "ENTRY_printer_SERIAL") })
+        with patch.object(helpers.er, "async_get", return_value=SimpleNamespace(entities=dict(enumerate(entries)))), \
+             patch.object(helpers.dr, "async_get", create=True, return_value=SimpleNamespace(devices={"printer": device})):
+            self.assertEqual(helpers.resolve_progress_entities(None, "SERIAL", "bambuddy"), {
+                "print_status": "sensor.renamed_status", "print_progress": "sensor.renamed_progress",
+                "hms": "sensor.renamed_hms", "pause": "button.renamed_pause",
+            })
 
 
 class Store:
@@ -131,28 +157,75 @@ class TestActivity(unittest.IsolatedAsyncioTestCase):
         await self.la._async_push()
         self.assertEqual(len(self.pushes), 1)
 
-    async def test_running_uses_absolute_native_countdown_without_progress(self):
+    async def test_running_shows_watch_minutes_without_seconds_or_progress(self):
         await self.start()
         data = self.pushes[0]["data"]
-        self.assertTrue(data.get("chronometer"))
-        self.assertEqual(data.get("when"), self.clock + 7200)
-        self.assertIs(data.get("when_relative"), False)
+        self.assertFalse(data["chronometer"])
+        self.assertNotIn("when", data)
         self.assertNotIn("progress", data)
-        self.assertNotIn("progress_max", data)
-        finish = datetime.fromtimestamp(self.clock + 7200, timezone.utc).strftime("%H:%M")
-        self.assertEqual(data["critical_text"], finish)
+        self.assertEqual(data["critical_text"], "2h 0m")
         await self.advance(3600)
         self.assertEqual(len(self.pushes), 1)
-        self.assertEqual(data["when"] - self.clock, 3600)
 
-    async def test_drift_update_retargets_native_countdown(self):
+    async def test_smaller_percentage_drift_waits_for_cooldown(self):
         await self.start()
         self.eta(300)
-        await self.advance(600)
-        data = self.pushes[-1]["data"]
-        self.assertTrue(data.get("chronometer"))
-        self.assertEqual(data.get("when"), 1_800_000_000 + 7500)
-        self.assertTrue(data["silent"])
+        await self.advance(599)
+        self.assertEqual(len(self.pushes), 1)
+        await self.advance(1)
+        self.assertEqual(self.pushes[-1]["data"]["critical_text"], "1h 55m")
+        self.assertTrue(self.pushes[-1]["data"]["silent"])
+
+    async def test_drift_over_fifty_percent_is_immediate(self):
+        await self.start()
+        self.eta(-3601)
+        await self.advance(0)
+        self.assertEqual(len(self.pushes), 2)
+        self.assertEqual(self.pushes[-1]["data"]["critical_text"], "1h 0m")
+
+    async def test_exactly_fifty_percent_still_waits(self):
+        await self.start()
+        self.eta(3600)
+        await self.advance(0)
+        self.assertEqual(len(self.pushes), 1)
+
+    async def test_bambuddy_hms_warns_once_and_recovers(self):
+        self.states["print_status"] = "printing"
+        self.la.entities["hms"] = "hms"
+        await self.start()
+        errors = [{"code": "07FF_8010", "description": "Check the filament spool"}]
+        current = SimpleNamespace(state="1", attributes={"errors": errors})
+        with patch.object(self.hass.states, "get", side_effect=lambda key: current if key == "hms" else self.get_state(key)):
+            event = SimpleNamespace(data={"entity_id": "hms", "new_state": current})
+            self.la._on_change(event)
+            await self.advance(0)
+            self.assertEqual(self.pushes[-2]["data"]["notification_icon"], "mdi:alert")
+            self.assertIn("07FF_8010", self.pushes[-1]["message"])
+            self.la._on_change(event)
+            await self.advance(0)
+            self.assertEqual(len(self.pushes), 3)
+            current.attributes["errors"] = []
+            self.la._on_change(event)
+            await self.advance(0)
+            self.assertEqual(len(self.pushes), 4)
+            self.assertEqual(self.pushes[-1]["data"]["notification_icon"], "mdi:printer-3d-nozzle")
+
+    async def test_bambuddy_finished_signal_runs_completion_once(self):
+        finished = []
+        async def on_finish():
+            finished.append(True)
+            await self.la.async_finish()
+        self.la.on_sensor_finish = on_finish
+        self.states["print_status"] = "printing"
+        await self.start()
+        self.states["print_status"] = "finished"
+        event = SimpleNamespace(data={"entity_id": "print_status", "new_state": self.get_state("print_status")})
+        self.la._on_change(event)
+        await self.advance(30)
+        self.la._on_change(event)
+        await self.advance(30)
+        self.assertEqual(finished, [True])
+        self.assertEqual(self.pushes[-1]["message"], "clear_notification")
 
     async def test_pause_and_unknown_eta_disable_native_countdown(self):
         for status in ("pause", "prepare", "slicing", "running"):
@@ -166,12 +239,12 @@ class TestActivity(unittest.IsolatedAsyncioTestCase):
                 if status == "running":
                     self.assertEqual(self.pushes[-1]["message"], "ETA unavailable")
 
-    async def test_preparing_with_valid_eta_also_uses_local_timer(self):
+    async def test_preparing_with_valid_eta_shows_minutes(self):
         self.states["print_status"] = "prepare"
         await self.start()
-        self.assertTrue(self.pushes[-1]["data"].get("chronometer"))
+        self.assertEqual(self.pushes[-1]["data"]["critical_text"], "2h 0m")
 
-    async def test_published_pause_disables_existing_timer(self):
+    async def test_paused_payload_has_no_live_timer(self):
         self.states["print_status"] = "pause"
         await self.start()
         self.assertIs(self.pushes[-1]["data"].get("chronometer"), False)
@@ -227,7 +300,7 @@ class TestActivity(unittest.IsolatedAsyncioTestCase):
             self.states["print_status"] = status
             self.la._on_change(SimpleNamespace(data={"entity_id": "print_status", "new_state": self.get_state("print_status")}))
             await self.advance(0)
-            self.assertEqual(self.pushes[-1]["data"]["chronometer"], status == "running")
+            self.assertEqual(self.pushes[-1]["data"]["critical_text"], "2h 0m" if status == "running" else "Paused")
         self.assertEqual(len(self.pushes), 3)
         self.assertEqual(self.la.starts, 1)
         self.assertFalse(any(p["message"] == "clear_notification" for p in self.pushes))
@@ -250,7 +323,7 @@ class TestActivity(unittest.IsolatedAsyncioTestCase):
         self.eta(0)
         await self.advance(0)
         self.assertEqual(len(self.pushes), 2)
-        self.assertTrue(self.pushes[-1]["data"]["chronometer"])
+        self.assertEqual(self.pushes[-1]["data"]["critical_text"], "2h 0m")
         self.eta(60)
         await self.advance(0)
         self.assertEqual(len(self.pushes), 2)
@@ -301,7 +374,7 @@ class TestActivity(unittest.IsolatedAsyncioTestCase):
 
     async def test_upgrade_synchronizes_existing_activity_once(self):
         await self.start()
-        self.store.data.pop("last_status")
+        self.store.data.pop("display_version")
         await self.la.async_stop()
         self.la = self.make_activity()
         await self.la.async_start()
@@ -327,7 +400,7 @@ class TestActivity(unittest.IsolatedAsyncioTestCase):
         await self.advance(0)
         self.assertEqual(len(self.pushes), 3)
         self.assertEqual(self.la.snapshot()["last_published_status"], "running")
-        self.assertTrue(self.pushes[-1]["data"]["chronometer"])
+        self.assertEqual(self.pushes[-1]["data"]["critical_text"], "2h 0m")
 
     async def test_terminal_clear_serialized_once(self):
         await self.start()
@@ -392,12 +465,12 @@ class TestActivity(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.la._next_rollover_at, 1_800_000_000 + activity.LONG_PRINT_ROLLOVER_SECONDS)
 
     async def test_configurable_drift_and_negative_drift(self):
-        self.la.options = {"eta_drift_minutes": 5}
+        self.la.options = {"eta_drift_percent": 5}
         await self.start()
         self.eta(-240)
         await self.advance(601)
         self.assertEqual(len(self.pushes), 1)
-        self.eta(-300)
+        self.eta(-340)
         await self.advance(2)
         self.assertEqual(len(self.pushes), 2)
 

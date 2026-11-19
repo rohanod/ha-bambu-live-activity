@@ -9,8 +9,8 @@ from homeassistant.helpers.typing import ConfigType
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.const import Platform
 
-from .const import CONF_PRINTER_SERIAL, DOMAIN
-from .helpers import resolve_print_status_entity
+from .const import BAMBU_DOMAIN, BAMBUDDY_DOMAIN, CONF_PRINTER_SERIAL, CONF_SOURCE, DOMAIN
+from .helpers import resolve_progress_entities
 from .runtime import BambuPrintNotificationsRuntime
 from .services import async_register_services
 from .dashboard import async_setup_assets, async_setup_dashboard, async_remove_dashboard
@@ -26,9 +26,14 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     serial = entry.data[CONF_PRINTER_SERIAL]
-    if resolve_print_status_entity(hass, serial) is None:
-        raise ConfigEntryNotReady("ha-bambulab print status entity is not ready")
-    runtime = BambuPrintNotificationsRuntime(hass, entry)
+    source = entry.options.get(CONF_SOURCE, entry.data.get(CONF_SOURCE))
+    for candidate in (source,) if source else (BAMBU_DOMAIN, BAMBUDDY_DOMAIN):
+        entities = resolve_progress_entities(hass, serial, candidate)
+        if {"print_status", "print_progress"} <= entities.keys():
+            break
+    else:
+        raise ConfigEntryNotReady("Printer status/progress entities are not ready")
+    runtime = BambuPrintNotificationsRuntime(hass, entry, candidate, entities)
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = runtime
     try:
         await runtime.async_start()

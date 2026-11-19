@@ -1,7 +1,8 @@
-// Integration-owned, read-only dashboard. No CDN, card install or push dependency.
+// Integration-owned dashboard using Home Assistant state and entity actions.
 export function presentation(states, entities, now = Date.now(), locale = 'en', timeZone = 'UTC') {
   const state = key => states[entities[key]];
-  const status = state('print_status')?.state ?? 'unknown';
+  const rawStatus = state('print_status')?.state ?? 'unknown';
+  const status = ({ preparing: 'prepare', printing: 'running', paused: 'pause', finished: 'finish' })[rawStatus] ?? rawStatus;
   const validText = value => value && !['unknown', 'unavailable', 'none'].includes(value.toLowerCase());
   const rawProgress = state('print_progress')?.state;
   const number = validText(rawProgress) ? Number(rawProgress) : NaN;
@@ -26,7 +27,7 @@ export function presentation(states, entities, now = Date.now(), locale = 'en', 
   }[status] ?? 'Printer unavailable';
   const name = state('model_name')?.state;
   return { status, title: validText(name) ? name : 'A1 mini', percent, progress, message,
-    remaining: status === 'running' ? remaining : status === 'pause' ? 'Paused' : '' };
+    remaining: ['running', 'pause', 'prepare', 'slicing'].includes(status) ? remaining : '' };
 }
 
 class BambuLiveActivityPanel extends HTMLElement {
@@ -52,6 +53,21 @@ class BambuLiveActivityPanel extends HTMLElement {
         .percent,.remaining { font-variant-numeric:tabular-nums; }
         .bar { grid-area:bar; height:5px; margin-top:6px; border-radius:3px; background:#FFFFFF24; overflow:hidden; }
         .fill { height:100%; border-radius:3px; background:var(--activity-accent,#3DDC84); }
+        section { margin-top:12px; padding:16px; border-radius:18px; background:var(--card-background-color,#182024); color:var(--primary-text-color,#F2F5F3); }
+        section[hidden], button[hidden], label[hidden] { display:none; }
+        h2 { font-size:16px; margin:0 0 10px; }
+        dl { display:grid; grid-template-columns:1fr 1fr; gap:8px 12px; margin:0; }
+        dt { color:var(--secondary-text-color,#AEB8B2); font-size:13px; }
+        dd { margin:2px 0 0; overflow-wrap:anywhere; }
+        ul { margin:0; padding-inline-start:20px; }
+        li + li { margin-top:8px; }
+        .actions { display:flex; gap:8px; flex-wrap:wrap; }
+        button, select { font:inherit; min-height:44px; padding:6px 12px; border:1px solid var(--divider-color,#67747a);
+          border-radius:8px; background:var(--secondary-background-color,#232b30); color:inherit; }
+        button:disabled, select:disabled { opacity:.55; }
+        button[data-control="stop"] { color:var(--error-color,#ff9b94); }
+        label { display:flex; align-items:center; gap:8px; margin-top:10px; }
+        .action-result:empty { display:none; }
         @media (max-width:350px) { main { padding:8px; } ha-card { padding:14px; gap:6px 8px; } }
       </style>
       <main><ha-card aria-label="A1 mini print progress">
@@ -59,7 +75,27 @@ class BambuLiveActivityPanel extends HTMLElement {
         <div class="title"></div><div class="percent"></div>
         <div class="message" role="status"></div><div class="remaining"></div>
         <div class="bar" role="progressbar" aria-label="Print progress" aria-valuemin="0" aria-valuemax="100"><div class="fill"></div></div>
-      </ha-card></main>`;
+      </ha-card>
+      <section class="details" hidden><h2>Printer details</h2><dl></dl></section>
+      <section class="warnings" hidden><h2>Printer warnings</h2><ul></ul></section>
+      <section class="controls" hidden><h2>Printer controls</h2>
+        <div class="actions">
+          <button type="button" data-control="pause">Pause</button>
+          <button type="button" data-control="resume">Resume</button>
+          <button type="button" data-control="stop">Stop print</button>
+          <button type="button" data-control="chamber_light">Light</button>
+        </div>
+        <label class="speed">Print speed <select></select></label>
+        <p class="action-result" role="status"></p>
+      </section></main>`;
+    this.shadowRoot.querySelector('.actions').addEventListener('click', event => {
+      const key = event.target.closest('button')?.dataset.control;
+      if (!key || (key === 'stop' && !window.confirm('Stop this print? It cannot be resumed.'))) return;
+      void this._runControl(key);
+    });
+    this.shadowRoot.querySelector('select').addEventListener('change', event => {
+      void this._runControl('speed', event.target.value);
+    });
   }
 
   set hass(value) { this._hass = value; this._render(); }
@@ -91,7 +127,91 @@ class BambuLiveActivityPanel extends HTMLElement {
     this.shadowRoot.querySelector('ha-icon').setAttribute('icon', view.status === 'pause' ? 'mdi:printer-pause' : 'mdi:printer-3d-nozzle');
     this.shadowRoot.querySelector('.bar').setAttribute('aria-valuenow', view.progress);
     this.shadowRoot.querySelector('.fill').style.width = `${view.progress}%`;
+    this._renderPrinter(config.entities, view.status);
   }
+  _renderPrinter(entities, status) {
+    const root = this.shadowRoot;
+    const states = this._hass.states;
+    const state = key => states[entities[key]];
+    const value = key => {
+      const entry = state(key);
+      return entry && !['unknown', 'unavailable', 'none'].includes(entry.state) ? entry.state : '';
+    };
+    const pretty = text => text.replaceAll('_', ' ');
+    const details = [
+      ['Stage', pretty(value('stage'))],
+      ['Layer', [value('current_layer'), value('total_layers')].filter(Boolean).join(' / ')],
+      ['Filament', value('filament')],
+      ['AMS', pretty(value('ams_status'))],
+      ['Nozzle', value('nozzle_temp') && `${value('nozzle_temp')} ${state('nozzle_temp').attributes.unit_of_measurement ?? ''}`],
+      ['Bed', value('bed_temp') && `${value('bed_temp')} ${state('bed_temp').attributes.unit_of_measurement ?? ''}`],
+      ['Maintenance', pretty(value('maintenance'))],
+    ].filter(([, text]) => text);
+    root.querySelector('.details').hidden = !details.length;
+    root.querySelector('dl').replaceChildren(...details.map(([label, text]) => {
+      const row = document.createElement('div');
+      const term = document.createElement('dt');
+      const desc = document.createElement('dd');
+      term.textContent = label;
+      desc.textContent = text;
+      row.append(term, desc);
+      return row;
+    }));
+
+    const errors = state('hms')?.attributes?.errors;
+    const warnings = Array.isArray(errors) && value('hms') ? errors.filter(error => error?.code) : [];
+    root.querySelector('.warnings').hidden = !warnings.length;
+    root.querySelector('ul').replaceChildren(...warnings.map(error => {
+      const item = document.createElement('li');
+      item.textContent = `${error.code} · ${error.description || error.severity || 'Check printer'}`;
+      return item;
+    }));
+
+    const active = ['running', 'pause', 'prepare', 'slicing'].includes(status);
+    const enabled = { pause: status === 'running', resume: status === 'pause', stop: active, chamber_light: true };
+    for (const button of root.querySelectorAll('[data-control]')) {
+      const key = button.dataset.control;
+      button.hidden = !entities[key];
+      button.disabled = Boolean(this._commandPending) || !state(key) || state(key).state === 'unavailable' || !enabled[key];
+    }
+    const light = root.querySelector('[data-control="chamber_light"]');
+    light.setAttribute('aria-pressed', String(value('chamber_light') === 'on'));
+    const speed = root.querySelector('select');
+    const options = state('speed')?.attributes?.options ?? [];
+    root.querySelector('.speed').hidden = !entities.speed;
+    if ([...speed.options].map(option => option.value).join() !== options.join()) {
+      speed.replaceChildren(...options.map(option => new Option(pretty(option), option)));
+    }
+    speed.value = value('speed');
+    speed.disabled = Boolean(this._commandPending) || !options.length || !value('speed');
+    root.querySelector('.controls').hidden = !Object.keys(enabled).some(key => entities[key]) && !entities.speed;
+  }
+
+  async _runControl(key, option) {
+    const entities = this._panel?.config?.entities ?? {};
+    const id = entities[key];
+    if (!id || this._commandPending || this._hass.states[id]?.state === 'unavailable') return;
+    const result = this.shadowRoot.querySelector('.action-result');
+    this._commandPending = true;
+    this._render();
+    try {
+      if (key === 'speed') {
+        if (!this._hass.states[id]?.attributes?.options?.includes(option)) return;
+        await this._hass.callService('select', 'select_option', { entity_id: id, option });
+      } else if (key === 'chamber_light') {
+        await this._hass.callService('light', 'toggle', { entity_id: id });
+      } else {
+        await this._hass.callService('button', 'press', { entity_id: id });
+      }
+      result.textContent = 'Command sent.';
+    } catch {
+      result.textContent = 'Command failed. Check the printer connection.';
+    } finally {
+      this._commandPending = false;
+      this._render();
+    }
+  }
+
 }
 
 if (!customElements.get('bambu-live-activity-panel')) {

@@ -2,11 +2,13 @@
 
 DOMAIN = "bambu_live_activity"
 BAMBU_DOMAIN = "bambu_lab"
+BAMBUDDY_DOMAIN = "bambuddy"
+CONF_SOURCE = "printer_source"
+DEFAULT_DRIFT_PERCENT = 3
+IMMEDIATE_DRIFT_PERCENT = 50
 
 CONF_PRINTER_SERIAL = "printer_serial"
 CONF_NOTIFY_SERVICE = "notify_service"
-
-KEY_PRINT_STATUS = "print_status"
 
 
 def dashboard_url_path(serial: str) -> str:
