@@ -63,8 +63,9 @@ class TestPrinterResolution(unittest.TestCase):
             entity("light", "chamber_light", "another_device_light", device="other"),
         ]
         device = SimpleNamespace(id="printer", serial_number="SERIAL", identifiers={ ("bambuddy", "ENTRY_printer_SERIAL") })
+        unrelated = SimpleNamespace(id="other", serial_number=None, identifiers={("other_integration", "network", "node")})
         with patch.object(helpers.er, "async_get", return_value=SimpleNamespace(entities=dict(enumerate(entries)))), \
-             patch.object(helpers.dr, "async_get", create=True, return_value=SimpleNamespace(devices={"printer": device})):
+             patch.object(helpers.dr, "async_get", create=True, return_value=SimpleNamespace(devices={"other": unrelated, "printer": device})):
             self.assertEqual(helpers.resolve_progress_entities(None, "SERIAL", "bambuddy"), {
                 "print_status": "sensor.renamed_status", "print_progress": "sensor.renamed_progress",
                 "hms": "sensor.renamed_hms", "pause": "button.renamed_pause",

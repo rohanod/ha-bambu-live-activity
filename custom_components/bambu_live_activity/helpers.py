@@ -29,10 +29,12 @@ def printer_identity(device, source):
     """Use the physical serial across integrations, including existing entries."""
     if device is None:
         return None
-    identifier = next((key for domain, key in device.identifiers if domain == source), None)
-    if identifier is None:
-        return None
-    return identifier if source == BAMBU_DOMAIN else device.serial_number
+    if source == BAMBU_DOMAIN:
+        return next((identifier[1] for identifier in device.identifiers
+                     if len(identifier) == 2 and identifier[0] == source), None)
+    if any(identifier and identifier[0] == source for identifier in device.identifiers):
+        return device.serial_number
+    return None
 
 
 def resolve_progress_entities(hass, serial, source=BAMBU_DOMAIN):
