@@ -9,7 +9,9 @@ from homeassistant.helpers.typing import ConfigType
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.const import Platform
 
-from .const import BAMBU_DOMAIN, BAMBUDDY_DOMAIN, CONF_PRINTER_SERIAL, CONF_SOURCE, DOMAIN
+from .const import (
+    BAMBU_DOMAIN, BAMBUDDY_DOMAIN, CONF_PRINTER_DEVICE, CONF_PRINTER_SERIAL, CONF_SOURCE, DOMAIN,
+)
 from .helpers import resolve_progress_entities
 from .runtime import BambuPrintNotificationsRuntime
 from .services import async_register_services
@@ -28,7 +30,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     serial = entry.data[CONF_PRINTER_SERIAL]
     source = entry.options.get(CONF_SOURCE, entry.data.get(CONF_SOURCE))
     for candidate in (source,) if source else (BAMBU_DOMAIN, BAMBUDDY_DOMAIN):
-        entities = resolve_progress_entities(hass, serial, candidate)
+        entities = resolve_progress_entities(hass, serial, candidate, entry.data.get(CONF_PRINTER_DEVICE))
         if {"print_status", "print_progress"} <= entities.keys():
             break
     else:
@@ -58,6 +60,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         return False
     runtime: BambuPrintNotificationsRuntime | None = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     if runtime is not None:
-        await runtime.async_stop()
-    async_remove_dashboard(hass, entry.data[CONF_PRINTER_SERIAL])
+        await runtime.async_stop(end_activity=runtime.serial != entry.data[CONF_PRINTER_SERIAL])
+        async_remove_dashboard(hass, runtime.serial)
     return True

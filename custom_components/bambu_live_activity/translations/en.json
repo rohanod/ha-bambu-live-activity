@@ -82,14 +82,17 @@
     "step": {
       "init": {
         "title": "Live Activity updates",
-        "description": "Choose the source for this printer. ETA shifts above 50% of the previously estimated remaining time publish immediately. Smaller qualifying shifts use a 10-minute cooldown.",
+        "description": "Choose the printer and its integration. Leave the printer blank to keep tracking the same hardware serial. ETA shifts above 50% publish immediately.",
         "data": {
+          "printer_device": "Bambu printer",
           "printer_source": "Printer integration",
           "eta_drift_percent": "Routine ETA drift threshold (%)"
         }
       }
     },
     "error": {
+      "not_bambu_device": "Select a printer device from the chosen integration.",
+      "already_configured": "Another Live Activity entry already tracks this printer.",
       "missing_bambu_entities": "Enable the matching printer\u2019s status and progress sensors in this integration first."
     }
   }

@@ -50,11 +50,11 @@ class BambuPrintNotificationsRuntime:
             )
         await self.live_activity.async_start()
 
-    async def async_stop(self) -> None:
+    async def async_stop(self, *, end_activity: bool = False) -> None:
         if self._unsub is not None:
             self._unsub()
             self._unsub = None
-        await self.live_activity.async_stop()
+        await self.live_activity.async_stop(end_activity=end_activity)
 
     @callback
     def _handle_bambu_event(self, event: Event) -> None:

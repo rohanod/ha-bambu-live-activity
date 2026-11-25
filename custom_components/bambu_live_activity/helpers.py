@@ -37,18 +37,18 @@ def printer_identity(device, source):
     return None
 
 
-def resolve_progress_entities(hass, serial, source=BAMBU_DOMAIN):
+def resolve_progress_entities(hass, serial, source=BAMBU_DOMAIN, device_id=None):
     """Anchor Bambuddy’s entity IDs to the status sensor on the matching device."""
     registry = er.async_get(hass)
     entries = list(registry.entities.values())
     keys = {key: key for key in COMMON_KEYS} | SOURCE_KEYS[source]
     if source == BAMBU_DOMAIN:
         prefix = f"{serial}_"
-        device_id = None
     else:
         devices = {
             device.id for device in dr.async_get(hass).devices.values()
-            if (printer_identity(device, source) or "").casefold() == serial.casefold()
+            if (device_id is None or device.id == device_id)
+            and (printer_identity(device, source) or "").casefold() == serial.casefold()
         }
         status_entries = [
             entry for entry in entries if entry.platform == source and entry.device_id in devices

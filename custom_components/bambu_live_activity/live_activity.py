@@ -209,13 +209,12 @@ class PrintLiveActivity:
         seen, self._print_seen = self._print_seen, False
         return seen
 
-    async def async_stop(self) -> None:
+    async def async_stop(self, *, end_activity: bool = False) -> None:
         self._stopped = True
         if self._unsub is not None:
             self._unsub()
             self._unsub = None
-        # No clear here: a reload/restart must not end the activity, or the
-        # restart creates a second one. The same tag is simply updated again.
+        # Ordinary reloads keep the activity open. A printer switch retires its old tag.
         task = self._start_task
         self._cancel_work()
         if task is not None and task is not asyncio.current_task():
@@ -223,6 +222,9 @@ class PrintLiveActivity:
         # Drain an in-flight notify/save before another runtime restores state.
         async with self._push_lock:
             pass
+        if end_activity:
+            self.consume_print_seen()
+            await self._async_clear(retiring=True)
 
     @callback
     def on_print_started(self) -> None:
@@ -588,10 +590,10 @@ class PrintLiveActivity:
         for attr in ("_update_unsub", "_rollover_unsub", "_retry_unsub", "_stop_unsub"):
             self._cancel_timer(attr)
 
-    async def _async_clear(self) -> None:
+    async def _async_clear(self, *, retiring: bool = False) -> None:
         self._cancel_work()
         async with self._push_lock:
-            if self._stopped:
+            if self._stopped and not retiring:
                 return
             if self._active or self._maybe_open:
                 try:
@@ -599,6 +601,8 @@ class PrintLiveActivity:
                     self._log("clear")
                 except Exception:
                     _LOGGER.warning("Unable to clear Bambu Live Activity", exc_info=True)
+                    if retiring:
+                        return
 
                     @callback
                     def retry_clear(_: datetime) -> None:

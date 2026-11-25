@@ -16,7 +16,9 @@ Requirements:
 - Either [Bambuddy](https://github.com/Spegeli/hacs_bambuddy) or [ha-bambulab](https://github.com/greghesp/ha-bambulab), configured for the printer.
 - iOS Companion App with Live Activities enabled and a working `notify.mobile_app_*` action.
 
-To switch an existing printer to Bambuddy, choose **Settings → Devices & services → Bambu Live Activity → Configure → Printer integration → Bambuddy**. The Bambuddy device must report the same hardware serial. This keeps your activity and dashboard identity. For a new setup, select both the source and its printer device.
+Open **Settings → Devices & services → Bambu Live Activity → Configure** to change the printer for an existing entry. Choose the **Bambu printer** and its **Printer integration**. Clear the printer field if you only want to switch integrations for the same hardware serial. Switching printers moves the dashboard and notification tracking to the selected device and closes the previous Live Activity. It does not stop the print.
+
+To track multiple printers at once, add a Bambu Live Activity entry for each printer. Each physical printer can belong to one entry.
 
 ## Update policy
 

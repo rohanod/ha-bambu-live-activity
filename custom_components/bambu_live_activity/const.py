@@ -8,6 +8,7 @@ DEFAULT_DRIFT_PERCENT = 3
 IMMEDIATE_DRIFT_PERCENT = 50
 
 CONF_PRINTER_SERIAL = "printer_serial"
+CONF_PRINTER_DEVICE = "printer_device"
 CONF_NOTIFY_SERVICE = "notify_service"
 
 

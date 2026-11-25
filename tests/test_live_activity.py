@@ -61,12 +61,16 @@ class TestPrinterResolution(unittest.TestCase):
             entity("button", "pause", "renamed_pause"),
             entity("button", "stop", "disabled_stop", disabled_by="user"),
             entity("light", "chamber_light", "another_device_light", device="other"),
+            entity("sensor", "status", "duplicate_status", device="mirror"),
+            entity("sensor", "progress", "duplicate_progress", device="mirror"),
         ]
         device = SimpleNamespace(id="printer", serial_number="SERIAL", identifiers={ ("bambuddy", "ENTRY_printer_SERIAL") })
+        mirror = SimpleNamespace(id="mirror", serial_number="SERIAL", identifiers={("bambuddy", "MIRROR_printer_SERIAL")})
         unrelated = SimpleNamespace(id="other", serial_number=None, identifiers={("other_integration", "network", "node")})
         with patch.object(helpers.er, "async_get", return_value=SimpleNamespace(entities=dict(enumerate(entries)))), \
-             patch.object(helpers.dr, "async_get", create=True, return_value=SimpleNamespace(devices={"other": unrelated, "printer": device})):
-            self.assertEqual(helpers.resolve_progress_entities(None, "SERIAL", "bambuddy"), {
+             patch.object(helpers.dr, "async_get", create=True, return_value=SimpleNamespace(devices={"other": unrelated, "printer": device, "mirror": mirror})):
+            self.assertEqual(helpers.resolve_progress_entities(None, "SERIAL", "bambuddy"), {})
+            self.assertEqual(helpers.resolve_progress_entities(None, "SERIAL", "bambuddy", "printer"), {
                 "print_status": "sensor.renamed_status", "print_progress": "sensor.renamed_progress",
                 "hms": "sensor.renamed_hms", "pause": "button.renamed_pause",
             })
@@ -84,6 +88,15 @@ class Store:
 
 
 class TestActivity(unittest.IsolatedAsyncioTestCase):
+    async def test_switching_printers_retires_old_activity(self):
+        await self.start()
+        await self.la.async_stop(end_activity=True)
+        self.assertEqual(self.pushes[-1], {
+            "message": "clear_notification", "data": {"tag": self.la.tag},
+        })
+        self.assertFalse(self.store.data["active"])
+        self.assertFalse(self.store.data["print_seen"])
+
     def setUp(self):
         self.clock = 1_800_000_000.0
         self.states = {"print_status": "running", "print_progress": "25",
